@@ -1,0 +1,565 @@
+# Deduplicating Backup Engine — Full Project Handoff
+
+**Owner:** Pratham Handa
+**Purpose:** Portfolio systems project targeting a Rubrik SWE internship application
+**Language/Platform:** C++17, Linux (WSL2 Ubuntu acceptable), CMake, OpenSSL
+**Status at handoff:** Components 1–2 written, reviewed, and algorithmically validated under a
+stand-in toolchain. **Nothing has been verified on Linux yet.** That is the first blocking task.
+
+This document is the single source of truth. It contains the problem statement, the domain
+background, the full architecture, on-disk format specifications, per-component build
+instructions, everything already built (including measured numbers and two hard-won technical
+derivations), the reduced scope for a time-constrained build, and the interview defence
+briefing. Hand this to a fresh Claude Code session and it should be able to continue without
+further context.
+
+---
+
+## PART 1 — THE PROBLEM AND WHY THIS DESIGN
+
+### 1.1 The problem in plain terms
+
+Back up a 100 GB laptop nightly with a naive copy and you store 3 TB a month, even though only
+a few GB of genuinely new information was created. Copying only changed *files* helps but stays
+wasteful: edit one metadata tag in a 2 GB video and you re-store 2 GB to capture a few hundred
+changed bytes. Ten employees holding the same 500 MB template store it ten times.
+
+### 1.2 The fix: content-addressed, deduplicated chunk storage
+
+Stop thinking in files. Split every file into small chunks (target 8 KB). Hash each chunk with
+SHA-256. Store chunks in a repository **keyed by their own hash** — content addressing: a chunk's
+name is derived from what it contains, not from where it came from.
+
+Backup then becomes: chunk the file, hash each chunk, ask the repository "do you already hold
+digest `a3f9c2…`?" If yes, store nothing. If no, append it. Record the ordered list of digests
+that reconstitutes the file — a *recipe*. A snapshot is a collection of recipes plus metadata.
+
+Restore reads a recipe, fetches each chunk by digest, concatenates in order, and verifies the
+result against a whole-file hash stored in the manifest.
+
+Consequences: the edited 2 GB video costs one chunk. The shared template is stored once. Ten
+nightly snapshots of a mostly-static tree cost barely more than one.
+
+### 1.3 The hard part: where do you cut?
+
+**Fixed-size chunking fails on insertion.** Cut every 8192 bytes by absolute offset, then insert
+one byte at the front. Every subsequent byte shifts one position, so every block boundary now
+covers different content. Dedup collapses to zero over a one-byte edit. *(We measured exactly
+this — see §4.3.)*
+
+**Content-defined chunking (CDC)** makes the cut decision a function of local content instead of
+absolute position. Slide a window, compute a rolling hash, declare a boundary when the hash
+satisfies a data-independent condition (low bits zero). Because the decision depends only on
+nearby bytes, an insertion disturbs the boundaries around it and downstream cuts re-derive
+themselves from unchanged content.
+
+We use **FastCDC** (Xia et al., USENIX ATC 2016).
+
+### 1.4 The other hard part: surviving a crash
+
+If the process dies mid-backup, the index must never claim a chunk exists that was never
+written — that produces silent corruption discovered months later at restore time.
+
+Solution: a **write-ahead log**. Ordering is strict and load-bearing:
+
+1. Append chunk bytes to the pack file, `fsync`.
+2. Append the index record `(digest → offset, length)` to the WAL with a CRC32, `fsync`.
+
+Crash between the two leaves an orphaned chunk on disk that nothing references — wasted space,
+never corruption. Crash in the reverse order would be fatal. On startup, replay the WAL and stop
+at the first record with a bad checksum or truncated length, discarding the torn tail.
+
+### 1.5 Why this project for Rubrik specifically
+
+Rubrik sells enterprise backup, dedup, and recovery. Chunk stores, incremental snapshots,
+crash-consistent metadata, and verified restores *are* the product, not an analogy to it.
+
+---
+
+## PART 2 — SCOPE (REDUCED FOR TIME CONSTRAINT)
+
+The original plan had eleven components. Below is the trimmed scope. **Every resume claim
+survives intact** — the cuts are all in polish, not in substance.
+
+### 2.1 Keep (load-bearing)
+
+| # | Component | Why it must stay |
+|---|-----------|------------------|
+| 1 | FastCDC chunker | The intellectual core. Already built. |
+| 2 | SHA-256 hasher | Content addressing depends on it. Already written. |
+| 3 | Chunk store (single pack file) | Where bytes actually live. |
+| 4 | Chunk index (WAL-backed, in-memory map) | Answers "do we have this chunk?" |
+| 5 | Write-ahead log | Top-three interview asset. The crash test is the differentiator. |
+| 6 | Snapshot manifest | The recipes. Without it there is no restore. |
+| 7 | Thread pool (per-file granularity) | Backs the "310 MB/s on 8 threads" claim. |
+| 8 | Restore + verify | Backs "byte-exact verified restores". |
+| 9 | Stats + bench | Produces the resume numbers. |
+| 10 | Four tests | Roundtrip, insertion-identity, crash-recovery, WAL torn-write. |
+| 11 | README | Architecture, formats, reproducible benchmark. |
+
+### 2.2 Cut (with rationale — document these as "future work" in the README)
+
+- **Pack file rotation at 64 MB.** Use one growing pack file. Rotation matters for real
+  operational concerns (parallel compaction, partial restore locality) that this project doesn't
+  exercise. ~1 hour saved.
+- **Garbage collection of orphaned chunks.** Document that crash-orphans accumulate and that GC
+  would be a mark-and-sweep over all manifests. Knowing *why* it's needed is the interview
+  currency; implementing it is not. ~3 hours saved.
+- **Streaming chunker across read-buffer boundaries.** *(This is the biggest saving.)* Originally
+  the pipeline was to stream fixed-size read buffers through a queue, forcing the chunker to
+  carry rolling state across buffer boundaries. Instead: **each worker reads one whole file and
+  chunks it in one pass.** Parallelism is per-file rather than intra-file. On a kernel tree
+  (~80,000 files) this saturates 8 threads trivially. Known limitation: a single enormous file
+  won't parallelise, and files must fit in memory. Both are defensible and worth stating aloud.
+  ~5 hours saved and removes an entire class of bugs.
+- **Chunk-size sweep as a CLI feature.** Run it manually once by rebuilding with different
+  `--avg-chunk-kb` values and record the numbers by hand.
+- **Index checkpointing.** The WAL *is* the index persistence — replay it fully on open. Note in
+  the README that a production system would checkpoint periodically to bound replay time.
+- **Symlinks, hardlinks, xattrs, ownership.** Regular files and directories only; preserve mode
+  bits and mtime. Skip anything else and log it.
+- **`--fixed-chunking` as a production flag.** It already exists inside `chunk_identity` for
+  comparison purposes; that's where it's needed.
+
+### 2.3 Realistic schedule
+
+Roughly **four to five focused evenings**. Components 3–6 are one evening each if the formats
+below are followed exactly; component 7 is half an evening; 8–11 together are one evening. The
+WAL crash test is the piece most likely to overrun — budget for it.
+
+---
+
+## PART 3 — ARCHITECTURE
+
+### 3.1 Repository layout on disk
+
+```
+<repo>/
+├── repo.meta                    # magic, version, chunker params (see §3.3)
+├── packs/
+│   └── pack-000001.dat          # append-only chunk bytes, single file
+├── wal.log                      # append-only index journal, CRC32 per record
+└── snapshots/
+    └── 20260907-143022.manifest # one per backup
+```
+
+**`repo.meta` stores the chunker parameters and the gear-table seed.** This is not decoration: if
+two builds disagreed on `min/avg/max` or the gear table, identical bytes would chunk differently
+and two snapshots of the same data would share zero chunks. On open, compare the binary's
+compiled-in parameters against `repo.meta` and **refuse to proceed on mismatch** with a clear
+error. This is a genuinely good detail to be able to point at.
+
+### 3.2 Source tree layout
+
+```
+dedup-backup/
+├── CMakeLists.txt
+├── verify_stage1.sh
+├── include/dedupbackup/
+│   ├── chunker.hpp              # IChunker, ChunkSpan            [DONE]
+│   ├── fastcdc_chunker.hpp      #                                [DONE]
+│   ├── fixed_chunker.hpp        #                                [DONE]
+│   ├── hasher.hpp               # IHasher, Digest, to_hex        [DONE]
+│   ├── sha256_hasher.hpp        #                                [DONE]
+│   ├── chunk_store.hpp          #                                [TODO c3]
+│   ├── chunk_index.hpp          #                                [TODO c4]
+│   ├── wal.hpp                  #                                [TODO c5]
+│   ├── manifest.hpp             #                                [TODO c6]
+│   ├── thread_pool.hpp          #                                [TODO c7]
+│   └── repository.hpp           # ties store+index+wal together  [TODO c3]
+├── src/
+│   ├── chunker/{fastcdc_chunker,fixed_chunker}.cpp               [DONE]
+│   ├── hasher/sha256_hasher.cpp                                  [DONE, UNCOMPILED]
+│   ├── store/…  index/…  wal/…  manifest/…  pipeline/…           [TODO]
+│   └── main.cpp                 # CLI                            [STUB]
+├── tools/
+│   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
+│   └── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, UNCOMPILED]
+└── tests/
+    └── CMakeLists.txt           # wired up in c10
+```
+
+### 3.3 On-disk format specifications
+
+All integers little-endian. All digests 32 raw bytes.
+
+**`repo.meta`**
+```
+magic        char[8]   "DEDUPBK1"
+version      u32       = 1
+min_size     u32       = 2048
+avg_size     u32       = 8192
+max_size     u32       = 65536
+gear_seed    u64       = 20240907
+```
+
+**`packs/pack-000001.dat`** — raw concatenated chunk bytes, no framing. Location is
+`(offset u64, length u32)` held in the index. Framing lives in the WAL, not the pack.
+
+**`wal.log`** — sequence of records:
+```
+length       u32       # byte count of type+payload
+type         u8        # 1 = CHUNK_ADD
+payload      bytes     # for CHUNK_ADD: digest[32] | offset u64 | length u32
+crc32        u32       # over type+payload
+```
+Replay from offset 0. Stop at the first record where fewer than `length` bytes remain or the
+CRC fails. Truncate the file to the last good record.
+
+**`snapshots/<id>.manifest`**
+```
+magic        char[8]   "DEDUPMF1"
+version      u32       = 1
+snapshot_id  char[16]  # "YYYYMMDD-HHMMSS"
+created_unix i64
+file_count   u64
+--- repeated file_count times, sorted by path for determinism ---
+path_len     u16
+path         bytes     # relative to backup root, '/' separated
+mode         u32
+size         u64
+mtime_unix   i64
+file_digest  byte[32]  # SHA-256 of whole file, for restore verification
+chunk_count  u32
+chunk_digests byte[32 * chunk_count]
+```
+
+### 3.4 CLI surface (reduced)
+
+```
+dedup-backup init    <repo>
+dedup-backup backup  <source-dir> --repo <repo> [--threads N]
+dedup-backup list    --repo <repo>
+dedup-backup restore <snapshot-id> <dest-dir> --repo <repo>
+dedup-backup verify  --repo <repo>
+dedup-backup stats   --repo <repo>
+dedup-backup bench   <source-dir> --repo <repo> [--threads N]
+```
+
+### 3.5 Concurrency model (simplified, per-file)
+
+- **One reader/walker thread** traverses the source tree with `std::filesystem::recursive_directory_iterator`, pushing file paths into a **bounded blocking queue** (capacity ~256).
+- **N worker threads** (default `std::thread::hardware_concurrency()`) each pop a path, read the
+  whole file, chunk it, hash each chunk, compute the whole-file digest, then take a **single
+  global mutex** to insert new chunks into the pack, append WAL records, and update the index.
+- Per-file manifest entries accumulate in a vector under the same mutex; sort by path before
+  writing so manifests are deterministic.
+- The queue must be **bounded** so a fast walker cannot exhaust memory on a large tree. That is
+  the backpressure design, and it is worth being able to explain.
+- **Known bottleneck to state honestly:** one global mutex serialises all store mutation.
+  Hashing and chunking — the CPU-heavy part — happen outside it, which is why throughput still
+  scales. Sharding the index by digest prefix is the obvious next step.
+
+---
+
+## PART 4 — WORK ALREADY COMPLETE
+
+### 4.1 Component 1 — FastCDC chunker `[DONE]`
+
+**Gear hash:** `hash = (hash << 1) + GEAR[byte]`, where `GEAR` is 256 pseudorandom `uint64_t`
+constants generated once from a hardcoded `std::mt19937_64` seed (`20240907`).
+
+Two properties matter:
+
+- **No window subtraction.** A Rabin-style rolling hash must subtract the byte leaving the
+  window. Gear skips this: the left shift pushes old contributions toward the high bits until
+  they overflow out of the 64-bit word, so influence decays naturally after ~64 bytes. An
+  approximation of a fixed window, but the FastCDC paper found it sufficient, and it saves a
+  subtraction and a lookup per byte.
+- **The seed must never change.** Different gear tables chunk identical bytes differently, so two
+  snapshots taken by different binaries would share zero chunks. Hence `gear_seed` in `repo.meta`.
+
+**Normalized chunking.** A single mask of N low bits gives a geometric chunk-size distribution —
+long tail of oversized chunks, excess of tiny ones. Tiny chunks bloat the index (one entry each);
+chunks near `max_size` aren't really content-defined, they're truncated. FastCDC uses two masks:
+
+- Below `avg_size`: **stricter** mask (`bits + 2` ones) — boundaries less likely, discourages
+  premature small chunks.
+- At/above `avg_size`: **looser** mask (`bits - 2` ones) — boundaries much more likely, pulls the
+  cut toward `avg_size` rather than drifting to `max_size`.
+
+With `bits = floor(log2(avg_size)) = 13`, that's a 15-bit and an 11-bit mask, reproducing the
+paper's pattern for an 8 KB average.
+
+**Core loop:**
+```cpp
+for (size_t i = config_.min_size; i < window; ++i) {
+    hash = (hash << 1) + gear[data[start + i]];
+    const uint64_t mask = (i < config_.avg_size) ? mask_s_ : mask_l_;
+    if ((hash & mask) == 0) { cut = i + 1; break; }
+}
+```
+Bytes before `min_size` are never hashed — no boundary test runs there, so hashing them is
+wasted work. If no boundary fires by `max_size`, cut there anyway (hard ceiling; without it a
+long run of identical bytes could produce an unbounded chunk).
+
+The hash is **reset to 0 at the start of every chunk**.
+
+**Known deviation from the paper:** we use contiguous low-bit masks; the paper uses masks with
+1-bits deliberately spread across the word (e.g. `0x0000d90003530000`) so the boundary decision
+samples a wider span of the rolling window. Ours works — the left shift still mixes several
+recent bytes into the low bits — but it is less deliberately spread. **This is documented in a
+comment above the mask computation and is a likely interview question.**
+
+**Instrumentation added:** `ChunkSpan` carries a `content_defined` flag, false only for a
+`max_size` truncation or the final short remainder. `FixedChunker` always reports false, since
+every one of its cuts is positional by construction.
+
+### 4.2 Component 2 — SHA-256 hasher `[WRITTEN, NEVER COMPILED]`
+
+`include/dedupbackup/hasher.hpp` defines `IHasher`, `Digest` (fixed 32 bytes), and `to_hex`.
+`sha256_hasher.cpp` uses OpenSSL's modern `EVP_Digest*` API, **not** the legacy `SHA256_*`
+functions deprecated in OpenSSL 3.x.
+
+**Why cryptographic, not xxHash/Murmur/CRC:** in a content-addressed store the hash *is* the
+identity check. A collision makes the store believe two different chunks are the same, store one,
+and silently corrupt every file referencing the other. Non-cryptographic hashes optimise for
+speed and distribution, not collision resistance; at 32/64 bits, accidental collisions become
+reachable at store scale via the birthday bound, and an adversary can construct them
+deliberately. SHA-256's 256-bit space is what licenses treating "same digest" as "same bytes"
+without ever comparing the bytes — which is the entire efficiency premise of content addressing.
+
+**Swappability:** `IHasher` is a one-method interface (`hash(data, len) -> Digest`) and all
+consumers depend on it, never on `Sha256Hasher`. `Digest` is fixed at 32 bytes rather than
+variable-length, trading the ability to drop in a different output size for zero heap allocation
+per chunk on the hottest path. Defensible because every plausible replacement (BLAKE2s, BLAKE3,
+SHA3-256) is also 32 bytes.
+
+### 4.3 Measurements so far
+
+**Caveat: every number below was produced under MinGW GCC 6.3 at `-std=gnu++14`, with
+`std::hash` substituted for SHA-256 in the identity tool. All of it must be reproduced on Linux
+with real SHA-256 before it is quoted anywhere.**
+
+Test input: 4 MB from the OS CSPRNG. Config `min=2048 avg=8192 max=65536`.
+
+Chunk-size distribution:
+```
+FastCDC:     457 chunks, mean 9178, median 9121, min 2156, max 21306
+Fixed 8 KB:  512 chunks, all exactly 8192
+```
+(457 × 9178 ≈ 4,194,346 ≈ 4 MB — internally consistent. Max of 21 KB sits well under the 64 KB
+ceiling, i.e. `mask_l` is working. Note `min 2156 ≠ min_size 2048`; nothing guarantees a chunk of
+exactly `min_size` occurs.)
+
+Chunk **identity** after inserting one byte:
+```
+FastCDC,    insert at offset 0:     457/457 chunks, 456 shared, 1 differing
+FastCDC,    insert at midpoint:     457/457 chunks, 456 shared, 1 differing
+Fixed-size, insert at offset 0:     512 vs 513,       0 shared   (total reflow)
+Fixed-size, insert at midpoint:     512 vs 513,     256 shared   (only the prefix survives)
+```
+This is the headline result and the proof the whole project rests on. Fixed-size dedup is purely
+a function of how much of the file precedes the edit; CDC's is not.
+
+A 50-offset pseudorandom sweep (seed `20240907`) showed **all 50 trials differing by exactly one
+chunk**, against a 15–512 spread for fixed-size. Boundary-origin baseline on this sample:
+456/457 content-defined, 1 truncation — and that one is the EOF remainder, not a real `max_size`
+hit. Truncation ratio ≈ 0.
+
+**Debugging anecdote worth keeping:** the first attempt generated "random" test bytes with a
+hand-rolled LCG and the chunker produced degenerate output — every chunk hit `max_size`. Not a
+chunker bug: an LCG's low bits have short cycles, and the gear hash's boundary test reads exactly
+those low bits. Switching to the OS CSPRNG fixed it immediately. Good story, and a real lesson
+about test-data quality.
+
+### 4.4 The resync derivation — CORRECTED, READ THIS CAREFULLY
+
+This went through three wrong explanations before landing. The final version is the one to use.
+
+**Why the distribution spikes at exactly 1:**
+
+The gear hash forgets its history after ~64 bytes. `min_size` is 2048 — **32× the warm-up
+distance** — so by the time the loop tests any position, the hash has entirely forgotten where
+its scan began. Therefore the set of file positions satisfying the cut condition (call them
+**candidate cut points**) is a property of the *content alone*, not of where chunking started.
+
+Trace an insertion: the chunk containing it has its boundary displaced to an essentially random
+new position. The next chunk starts there, skips `min_size` (far past warm-up), then cuts at the
+**first candidate it encounters**. If no candidate lies between the old scan-start and the new
+one, it lands on *exactly the same candidate the original chunk used* — alignment restored in a
+single chunk. That is the common case, and it explains a sharp spike at 1 rather than a spread.
+
+**Three explanations that are wrong, and why** (each may come up in interview):
+
+1. *"The hash reset at each chunk start makes each chunk's boundary a pure function of its own
+   bytes, so resync is architecturally immediate."* No. The reset plus the `min_size` skip means a
+   boundary's position depends on where its chunk started, so boundaries form a **chain**. The
+   reset argues *against* guaranteed resync, not for it.
+2. *"It cascades unboundedly."* Overstated. The decay property makes candidates position-
+   independent, which is what damps the chain.
+3. *"It realigns by coincidence."* Coincidence would produce a spread, not 50/50 at exactly 1.
+
+**Residual second-order effect:** normalized chunking selects its mask by distance from the chunk
+start, so the candidate set is not *perfectly* position-independent. Small on random data.
+
+**The honest framing:** high-probability for a specific structural reason, not guaranteed. A pure
+sliding-window CDC with no reset and no minimum size *would* have a provable one-window resync
+bound. FastCDC trades that guarantee away for speed and a bounded size distribution. **That
+trade is the interesting answer**, and it's better than any of the three wrong ones.
+
+### 4.5 The `max_size` limitation — documented
+
+When a chunk hits `max_size` without a boundary firing, the cut is placed at a fixed offset from
+the chunk start. That cut is **purely positional, with zero content dependency**, so it breaks
+the alignment argument outright — the following chunk starts at an arbitrary position with no
+content-derived reason to realign.
+
+On uniform random bytes candidates are dense and `max_size` essentially never fires (our sample
+topped out at 21 KB). **Real source trees are different**: long zero runs, repeated boilerplate,
+low-entropy regions where candidates are sparse and truncation *will* fire. That is the concrete
+mechanism by which the resync distribution could widen on kernel data.
+
+This is why `content_defined` instrumentation exists. **The truncation ratio on the kernel tree
+versus ≈0 on random data is the diagnostic**, and both numbers belong in the README.
+
+---
+
+## PART 5 — IMMEDIATE NEXT STEPS
+
+### 5.1 Environment (blocking everything)
+
+WSL2 on Windows 11 is a real Linux kernel — real `fsync`, real ext4, real `std::filesystem` —
+and is fully adequate, including for benchmark numbers.
+
+PowerShell as Administrator:
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+Reboot, set username/password, then inside Ubuntu:
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake libssl-dev git
+```
+
+**Critical:** do **not** keep the repo under `/mnt/c/`. The Windows↔Linux translation layer is
+slow enough to make throughput numbers meaningless. Work in `~/`. Push from Windows, clone
+inside WSL. In VS Code install the **WSL extension** and use *WSL: Reopen Folder in WSL* so the
+editor and any Claude Code session both execute in Linux.
+
+Free space needed: ~30 GB.
+
+### 5.2 First task — verify stages 1 and 2
+
+```bash
+cd ~/dedup-backup
+bash verify_stage1.sh
+```
+Expect warnings; nothing has met `-Wall -Wextra` on GCC/Clang yet. The `%zu` format warnings seen
+under MinGW are an old-runtime quirk and will not appear against glibc.
+
+Then run `chunk_identity` for real, with actual SHA-256, and reproduce §4.3. **If the numbers
+differ, the real ones win.**
+
+Only C++17 dependency in the tree today: a structured binding in `chunk_identity.cpp`.
+`std::filesystem` arrives in component 6.
+
+### 5.3 Then build, in order
+
+Components 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11, per Part 2 and the formats in §3.3.
+
+---
+
+## PART 6 — BENCHMARK PROCEDURE
+
+```bash
+mkdir -p ~/bench && cd ~/bench
+for v in 1 2 3 4 5 6 7 8; do
+  wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.$v.tar.xz
+  mkdir -p tree-$v && tar xf linux-6.6.$v.tar.xz -C tree-$v
+done
+```
+
+Eight consecutive kernel releases, ~9.6 GB extracted. This dataset is chosen deliberately: it is
+reproducible by anyone, and consecutive releases have the "mostly unchanged with genuine churn"
+profile dedup is built for. Ten copies of the *same* tree would give 90%+ and prove nothing.
+
+```bash
+dedup-backup init ~/repo
+for v in 1 2 3 4 5 6 7 8; do
+  dedup-backup backup ~/bench/tree-$v --repo ~/repo
+done
+dedup-backup stats --repo ~/repo
+dedup-backup bench ~/bench/tree-1 --repo ~/repo-bench
+```
+
+Also run: the 50-offset resync sweep against a kernel tree (not just synthetic), and the
+`content_defined` truncation ratio for both datasets.
+
+### Resume claims that must come from this run
+
+The following are currently **targets**, not measurements. Replace with real numbers before
+submitting anything.
+
+| Claim on resume | Target | Notes |
+|---|---|---|
+| Dedup reduction | **76% (4.2×)** | Conservative for 8 kernel trees. 71% or 81% is fine — quote the real one. |
+| Dataset size | **9.6 GB** | Whatever your extraction actually totals. |
+| Throughput | **310 MB/s on 8 threads** | Deliberately conservative. SHA-256 without SHA-NI runs ~250–400 MB/s per core; you will likely beat this. |
+| Crash-consistent WAL | — | Backed by the crash-recovery test. |
+| Byte-exact verified restores | — | Backed by manifest file digests. |
+
+---
+
+## PART 7 — TESTS (component 10, four only)
+
+1. **Roundtrip.** Back up a generated tree, restore it, assert byte-exact equality and matching
+   mode/mtime.
+2. **Insertion identity.** Back up a file, insert one byte at the front, back up again, assert
+   the second snapshot added only a small number of new chunks. *This is the test that proves
+   CDC works.*
+3. **Crash recovery.** `kill -9` mid-backup, restart, assert the previous snapshot still restores
+   byte-exactly and the WAL replayed cleanly.
+4. **WAL torn write.** Truncate `wal.log` mid-record, assert clean recovery to the last good
+   record with no crash and no bogus index entries.
+
+---
+
+## PART 8 — INTERVIEW DEFENCE BRIEFING
+
+**Why CDC over fixed-size blocks?** The boundary-shift problem. Quote the measured numbers:
+456/457 shared versus 0/512 after a front insertion.
+
+**How does FastCDC pick a boundary?** Rolling gear hash, cut when the masked low bits are zero.
+Expected chunk size 2^N. Min/max enforced because the geometric distribution otherwise produces
+pathological chunks at both ends. Normalized chunking uses two masks to tighten it.
+
+**Why 8 KB average?** Dedup granularity versus index overhead — smaller chunks find more
+redundancy but multiply index entries and per-chunk metadata. Quote your own 4/8/16 KB sweep.
+
+**Why those specific mask constants in the paper?** Scattered 1-bits sample the rolling window
+more evenly across its span; our contiguous masks are a documented simplification.
+
+**Hash collisions?** Birthday bound ~2^-128, orders of magnitude below undetected disk error
+rates. Same argument every production dedup system makes.
+
+**What happens on a crash mid-backup?** Chunk bytes then WAL record, each fsynced. Crash between
+leaves an unreferenced orphan — wasted space, never corruption. Replay stops at the first bad
+CRC. Reverse ordering would be fatal. Proven by test 3.
+
+**Where's the bottleneck?** SHA-256, not I/O — confirm with `perf`. Next steps: SHA-NI intrinsics
+or BLAKE3. Secondary: the single global store mutex; shard the index by digest prefix.
+
+**How do you know restores are correct?** Per-file SHA-256 in the manifest, recomputed after
+restore and compared.
+
+**How fast does chunking resync after an edit?** Use §4.4. Lead with the decay/candidate-cut-point
+derivation, note it's high-probability rather than guaranteed, and mention the FastCDC-versus-
+pure-CDC trade. Then raise the `max_size` truncation limitation from §4.5 yourself — volunteering
+the failure mode of your own design is the strongest move available.
+
+**What would you do next?** Garbage collection of orphans, index checkpointing to bound WAL
+replay, pack rotation with compaction, intra-file parallelism for large files, compression on
+top of dedup.
+
+---
+
+## PART 9 — WORKING AGREEMENT FOR THE NEXT SESSION
+
+1. Build one component at a time. Show code, explain decisions, stop, wait.
+2. **Never present a number without stating exactly which binary produced it and what command was
+   run.** This has already caused one round of confusion.
+3. A scratch file that isn't in the repo must not be the source of a headline number.
+4. Compile-tested is not tested. Every component gets run on Linux before the next one starts.
+5. When a derivation is challenged, re-derive from mechanism rather than defending the previous
+   answer. Two of the three wrong resync explanations came from defending rather than re-deriving.
