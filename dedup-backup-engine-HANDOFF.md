@@ -164,7 +164,8 @@ dedup-backup/
 │   ├── sha256_hasher.hpp        #                                [DONE, VERIFIED]
 │   ├── chunk_store.hpp          # ChunkLocation, ChunkStore       [DONE, VERIFIED]
 │   ├── chunk_index.hpp          # DigestHash, ChunkIndex          [DONE, VERIFIED]
-│   ├── wal.hpp                  #                                [TODO c5]
+│   ├── wal.hpp                  # Wal, WalRecordType, crc32       [DONE, VERIFIED]
+│   ├── byte_io.hpp              # LE read/write helpers           [DONE, VERIFIED]
 │   ├── manifest.hpp             #                                [TODO c6]
 │   ├── thread_pool.hpp          #                                [TODO c7]
 │   └── repository.hpp           # ties store+index+wal together  [TODO c3]
@@ -173,13 +174,15 @@ dedup-backup/
 │   ├── hasher/sha256_hasher.cpp                                  [DONE, VERIFIED]
 │   ├── store/chunk_store.cpp                                     [DONE, VERIFIED]
 │   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
-│   ├── wal/…  manifest/…  pipeline/…                             [TODO]
+│   ├── wal/wal.cpp                                                [DONE, VERIFIED]
+│   ├── manifest/…  pipeline/…                                    [TODO]
 │   └── main.cpp                 # CLI                            [STUB]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
 │   ├── store_check.cpp          # pack-file round-trip + reopen  [DONE, VERIFIED]
-│   └── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
+│   ├── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
+│   └── wal_check.cpp            # CRC32 self-test + torn-write   [DONE, VERIFIED]
 └── tests/
     └── CMakeLists.txt           # wired up in c10
 ```
@@ -519,6 +522,65 @@ logical bytes: 9627507, physical bytes stored: 3150137, saved: 67.3%
 round-trip OK: all 300 logical chunks resolve to correct bytes via the index
 ```
 Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
+### 4.8 Component 5 — write-ahead log `[DONE, VERIFIED]`
+
+`Wal` is the index's persistence (§4.7): on startup, `replay()` walks the file from byte 0 and
+calls `ChunkIndex::insert()` for every valid record. There is no separate index file — the WAL
+*is* the source of truth, exactly as scoped in §2.2.
+
+**Format, exactly per §3.3:** `length u32 | type u8 | payload | crc32 u32`, all little-endian.
+For `CHUNK_ADD` (the only defined type): `payload = digest[32] | offset u64 | length u32` (44
+bytes), so the full on-disk record is `4 + 1 + 44 + 4 = 53` bytes. The CRC covers `type + payload`
+only (45 bytes) — not the length prefix, since the length prefix is what tells a reader how many
+bytes to feed the CRC in the first place, so it can't be self-referential.
+
+**CRC32 implemented from scratch** (standard IEEE 802.3 / zlib polynomial `0xEDB88320`, table
+generated once via static init — the same "build a lookup table on first use" pattern as the gear
+table in the chunker, for consistency). Verified against the standard CRC-32/ISO-HDLC test vector:
+`crc32("123456789") == 0xCBF43926`. Not the WAL's own invention — a recognizable, standard
+algorithm, which matters for defensibility ("did you implement CRC32 correctly" is answerable with
+a known test vector, not just "trust me").
+
+**Little-endian I/O factored into `byte_io.hpp`** (`write_u32_le`/`read_u32_le`/`write_u64_le`/
+`read_u64_le`) rather than duplicated in the WAL and, later, the manifest (component 6, which
+needs identical LE serialization per §3.3). Deliberately explicit byte-at-a-time shift/mask
+instead of a struct memcpy — struct padding and host endianness are both compiler/platform
+decisions the on-disk format can't depend on; explicit serialization is portable regardless.
+
+**`pwrite`/`pread` at tracked offsets, same pattern as `ChunkStore`** (§4.6) — for the same reason:
+no shared file-offset cursor to race over between a hypothetical concurrent reader and the single
+writer.
+
+**Torn-tail recovery is a physical truncation, not just an in-memory stop.** `replay()` stops
+scanning at the first record that's too short for its own length prefix, or whose CRC doesn't
+match, then calls `ftruncate()` to physically cut the file at the last good record boundary. This
+matters: without it, a later append would write new valid bytes starting right after the last good
+record, but any leftover garbage past the end of *that* new record would still physically be on
+disk, waiting for some future replay to walk into it. Truncating removes that failure class
+outright rather than relying on probability (garbage bytes never coincidentally passing a length+
+CRC check).
+
+**Durability ordering — the actual crash-safety guarantee (§1.4):** `ChunkStore::append()` fsyncs
+chunk bytes; only then does `Wal::append_chunk_add()` write and fsync the record that references
+them. A crash between the two leaves an orphaned, unreferenced chunk in the pack file — wasted
+space, never corruption, because nothing durable ever claimed to know about it. The reverse order
+would be fatal: a durably-written WAL record could reference chunk bytes that were never actually
+written, and replay would hand the index a location pointing at garbage or past-EOF.
+
+**Verified on Linux** (`tools/wal_check.cpp`, WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08) — this is
+the real foundation for the component-10 WAL-torn-write CTest test, run here as a standalone
+binary first:
+```
+CRC32 self-test OK (0xcbf43926 matches standard test vector)
+clean replay OK: 50/50 records recovered correctly after reopen
+torn-write replay OK: recovered exactly 55 good records, discarded the torn tail
+physical truncation OK: file shrank from 2925 to 2915 bytes on disk
+post-recovery append OK: 56 total records replay cleanly
+```
+The 2925→2915 shrink is exact, not approximate: 55 good records × 53 bytes/record = 2915 bytes;
+the 10 hand-crafted "crash mid-write" garbage bytes were physically removed, not merely skipped
+over. Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
 ---
 

@@ -24,6 +24,7 @@ add_library(dedupbackup_core STATIC
     src/hasher/sha256_hasher.cpp
     src/store/chunk_store.cpp
     src/index/chunk_index.cpp
+    src/wal/wal.cpp
 )
 target_include_directories(dedupbackup_core PUBLIC include)
 target_link_libraries(dedupbackup_core PUBLIC OpenSSL::Crypto)
@@ -42,6 +43,9 @@ target_link_libraries(store_check PRIVATE dedupbackup_core)
 
 add_executable(index_check tools/index_check.cpp)
 target_link_libraries(index_check PRIVATE dedupbackup_core)
+
+add_executable(wal_check tools/wal_check.cpp)
+target_link_libraries(wal_check PRIVATE dedupbackup_core)
 
 enable_testing()
 add_subdirectory(tests)
