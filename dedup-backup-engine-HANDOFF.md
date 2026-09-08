@@ -3,8 +3,9 @@
 **Owner:** Pratham Handa
 **Purpose:** Portfolio systems project targeting a Rubrik SWE internship application
 **Language/Platform:** C++17, Linux (WSL2 Ubuntu acceptable), CMake, OpenSSL
-**Status at handoff:** Components 1–2 written, reviewed, and algorithmically validated under a
-stand-in toolchain. **Nothing has been verified on Linux yet.** That is the first blocking task.
+**Status at handoff:** Components 1–2 written, reviewed, and **verified on real Linux** (WSL2
+Ubuntu-24.04, GCC 13.3.0, OpenSSL 3.0.13, real SHA-256) as of 2026-09-08 — see §4.3/§4.4 for the
+verified transcript. Next task: component 3 (chunk store).
 
 This document is the single source of truth. It contains the problem statement, the domain
 background, the full architecture, on-disk format specifications, per-component build
@@ -160,8 +161,8 @@ dedup-backup/
 │   ├── fastcdc_chunker.hpp      #                                [DONE]
 │   ├── fixed_chunker.hpp        #                                [DONE]
 │   ├── hasher.hpp               # IHasher, Digest, to_hex        [DONE]
-│   ├── sha256_hasher.hpp        #                                [DONE]
-│   ├── chunk_store.hpp          #                                [TODO c3]
+│   ├── sha256_hasher.hpp        #                                [DONE, VERIFIED]
+│   ├── chunk_store.hpp          # ChunkLocation, ChunkStore       [DONE, VERIFIED]
 │   ├── chunk_index.hpp          #                                [TODO c4]
 │   ├── wal.hpp                  #                                [TODO c5]
 │   ├── manifest.hpp             #                                [TODO c6]
@@ -169,12 +170,14 @@ dedup-backup/
 │   └── repository.hpp           # ties store+index+wal together  [TODO c3]
 ├── src/
 │   ├── chunker/{fastcdc_chunker,fixed_chunker}.cpp               [DONE]
-│   ├── hasher/sha256_hasher.cpp                                  [DONE, UNCOMPILED]
-│   ├── store/…  index/…  wal/…  manifest/…  pipeline/…           [TODO]
+│   ├── hasher/sha256_hasher.cpp                                  [DONE, VERIFIED]
+│   ├── store/chunk_store.cpp                                     [DONE, VERIFIED]
+│   ├── index/…  wal/…  manifest/…  pipeline/…                    [TODO]
 │   └── main.cpp                 # CLI                            [STUB]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
-│   └── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, UNCOMPILED]
+│   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
+│   └── store_check.cpp          # pack-file round-trip + reopen  [DONE, VERIFIED]
 └── tests/
     └── CMakeLists.txt           # wired up in c10
 ```
@@ -327,25 +330,32 @@ SHA3-256) is also 32 bytes.
 
 ### 4.3 Measurements so far
 
-**Caveat: every number below was produced under MinGW GCC 6.3 at `-std=gnu++14`, with
-`std::hash` substituted for SHA-256 in the identity tool. All of it must be reproduced on Linux
-with real SHA-256 before it is quoted anywhere.**
+**Verified on real Linux 2026-09-08:** WSL2 Ubuntu-24.04, GCC 13.3.0, CMake 3.28.3, OpenSSL
+3.0.13, `-std=c++17 -Wall -Wextra` — **zero warnings.** Real `chunk_identity` binary, real SHA-256
+via OpenSSL EVP, not a stand-in. This supersedes an earlier MinGW/`std::hash` pre-check that
+produced structurally identical but numerically different results (documented below for
+context — the discrepancy is expected, not a bug: see note on exact counts).
 
-Test input: 4 MB from the OS CSPRNG. Config `min=2048 avg=8192 max=65536`.
+Test input: 4 MB from the OS CSPRNG (fresh random bytes each run — see note below on why exact
+chunk counts aren't reproducible run-to-run even though the *structure* of the results is).
+Config `min=2048 avg=8192 max=65536`.
 
 Chunk-size distribution:
 ```
-FastCDC:     457 chunks, mean 9178, median 9121, min 2156, max 21306
+FastCDC:     440 chunks, mean 9533, median 9433, min 2060, max 20345
 Fixed 8 KB:  512 chunks, all exactly 8192
 ```
-(457 × 9178 ≈ 4,194,346 ≈ 4 MB — internally consistent. Max of 21 KB sits well under the 64 KB
-ceiling, i.e. `mask_l` is working. Note `min 2156 ≠ min_size 2048`; nothing guarantees a chunk of
+(440 × 9533 ≈ 4,194,520 ≈ 4 MB — internally consistent. Max of 20 KB sits well under the 64 KB
+ceiling, i.e. `mask_l` is working. Note `min 2060 ≠ min_size 2048`; nothing guarantees a chunk of
 exactly `min_size` occurs.)
 
-Chunk **identity** after inserting one byte:
+Boundary origin: **439/440 content-defined, 1/440 (0.23%) positional** — that one is the EOF
+remainder, not a real `max_size` hit. Truncation ratio ≈ 0, as predicted for high-entropy input.
+
+Chunk **identity** after inserting one byte (real SHA-256):
 ```
-FastCDC,    insert at offset 0:     457/457 chunks, 456 shared, 1 differing
-FastCDC,    insert at midpoint:     457/457 chunks, 456 shared, 1 differing
+FastCDC,    insert at offset 0:     440/440 chunks, 439 shared, 1 differing
+FastCDC,    insert at midpoint:     440/440 chunks, 439 shared, 1 differing
 Fixed-size, insert at offset 0:     512 vs 513,       0 shared   (total reflow)
 Fixed-size, insert at midpoint:     512 vs 513,     256 shared   (only the prefix survives)
 ```
@@ -353,9 +363,23 @@ This is the headline result and the proof the whole project rests on. Fixed-size
 a function of how much of the file precedes the edit; CDC's is not.
 
 A 50-offset pseudorandom sweep (seed `20240907`) showed **all 50 trials differing by exactly one
-chunk**, against a 15–512 spread for fixed-size. Boundary-origin baseline on this sample:
-456/457 content-defined, 1 truncation — and that one is the EOF remainder, not a real `max_size`
-hit. Truncation ratio ≈ 0.
+chunk** — `min=1 max=1 mean=1.00`, entire histogram mass at "1 chunk differs: 50 trials" — against
+a 15–512 spread (`mean=266.30`) for fixed-size. This is the real, non-stand-in confirmation of the
+decay-based derivation in §4.4: not just plausible, empirically exact on this dataset.
+
+Multi-byte edit shapes (real SHA-256): 100-byte insert and 100-byte delete both cost FastCDC
+exactly 1 chunk, same as the single-byte case. A 10 KiB insert cost 1 chunk on the original side
+but 2 on the modified side (`440→441` total) — expected: 10 KiB of new content is itself larger
+than one average chunk, so the edit doesn't just displace a boundary, it also introduces roughly
+one whole new chunk's worth of genuinely new material.
+
+**Note on exact counts not being reproducible run-to-run:** `chunk_identity --gen` draws from
+`std::random_device` (the OS CSPRNG) fresh every invocation, so the *exact* chunk count varies
+between runs (457 in the original MinGW/`std::hash` pre-check vs. 440 here) even on an identical
+4 MB size and config — different random bytes produce different candidate cut points. What stays
+invariant across runs is the *structure*: mean near `avg_size`, max well under `max_size`,
+truncation ratio ≈ 0, and — the actual claim — the resync distribution spiking at exactly 1. Don't
+be alarmed if a future run shows yet another chunk count; that alone is not a regression signal.
 
 **Debugging anecdote worth keeping:** the first attempt generated "random" test bytes with a
 hand-rolled LCG and the chunker produced degenerate output — every chunk hit `max_size`. Not a
@@ -413,6 +437,51 @@ mechanism by which the resync distribution could widen on kernel data.
 This is why `content_defined` instrumentation exists. **The truncation ratio on the kernel tree
 versus ≈0 on random data is the diagnostic**, and both numbers belong in the README.
 
+### 4.6 Component 3 — chunk store `[DONE, VERIFIED]`
+
+`ChunkStore` owns a single append-only pack file. No digest/dedup awareness at all — that's the
+index's job (component 4). It answers exactly two questions: "store these bytes, tell me where,"
+and "give me the bytes at this (offset, length)."
+
+**Why pack files, not one-file-per-chunk.** A real backup produces tens of thousands of chunks.
+One file per chunk means one inode per chunk (filesystem metadata overhead), a full block
+allocated per chunk regardless of chunk size (a 2 KB chunk still burns a full 4 KB block on most
+filesystems), one `open()`/`close()` pair per chunk, and a directory with tens of thousands of
+entries that's slow to list or `rsync`. Packing amortizes all of it: one `open()` per backup,
+sequential writes, no per-chunk filesystem metadata operation.
+
+**Why `pwrite`/`pread` at explicit offsets, not `write`/`read` with `O_APPEND`.** `write()` and
+`read()` on one fd share an implicit file-offset cursor — a concurrent reader (restore) and writer
+(backup) on the same store would race over where the next operation lands. `pwrite()`/`pread()`
+take the offset explicitly and never touch that cursor, removing the race by construction. (There's
+also a Linux-specific wrinkle where `O_APPEND` affects `pwrite()` in a way that contradicts POSIX —
+one more reason to avoid the combination.)
+
+**Durability contract:** `append()` does not return until `fsync()` completes. This is the
+half of the WAL ordering guarantee (§1.4) that lives in this component — the WAL (component 5)
+depends on being able to write a record pointing at a chunk immediately after `append()` returns,
+trusting the bytes are already durable.
+
+**Verified on Linux** (`tools/store_check.cpp`, WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08): 500
+random chunks (1 byte–64 KB) appended to a fresh pack file, all 500 read back byte-identical by
+their returned `(offset, length)`, then the store was destructed and reopened against the same
+file — the reopened instance correctly resumed appending at the exact byte offset the previous
+instance left off at, and the newly appended chunk round-tripped correctly too. Real transcript:
+```
+appended 500 chunks, pack file now 16158857 bytes
+round-trip OK: all 500 chunks read back byte-identical
+reopen OK: appended after existing 16158857 bytes, round-tripped correctly
+```
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
+**Known limitation, by design (see §2.2):** one growing pack file, no rotation at a size
+threshold. Also: this component provides no crash-safety on its own — a `kill -9` between the
+`pwrite` loop and the `fsync` could in principle leave a torn write in the pack file. In practice
+this is why the WAL never trusts a pack file offset it hasn't itself durably recorded: an orphaned
+or torn chunk at the tail of the pack file, from a chunk whose WAL record never got written, is
+simply never referenced by anything and is harmless. Verifying that end-to-end is component 5's
+crash-recovery test, not this component's.
+
 ---
 
 ## PART 5 — IMMEDIATE NEXT STEPS
@@ -439,17 +508,11 @@ editor and any Claude Code session both execute in Linux.
 
 Free space needed: ~30 GB.
 
-### 5.2 First task — verify stages 1 and 2
+### 5.2 First task — verify stages 1 and 2 `[DONE 2026-09-08]`
 
-```bash
-cd ~/dedup-backup
-bash verify_stage1.sh
-```
-Expect warnings; nothing has met `-Wall -Wextra` on GCC/Clang yet. The `%zu` format warnings seen
-under MinGW are an old-runtime quirk and will not appear against glibc.
-
-Then run `chunk_identity` for real, with actual SHA-256, and reproduce §4.3. **If the numbers
-differ, the real ones win.**
+Completed on WSL2 Ubuntu-24.04. `cmake --build` produced zero warnings at `-Wall -Wextra` under
+GCC 13.3.0. `chunk_identity` reproduced §4.3 with real SHA-256 — see that section for the verified
+numbers. This gate is closed; component 3 is next.
 
 Only C++17 dependency in the tree today: a structured binding in `chunk_identity.cpp`.
 `std::filesystem` arrives in component 6.
