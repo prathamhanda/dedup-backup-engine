@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -52,6 +53,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string repo_dir = argv[1];
+    // Idempotent/repeatable under CTest -- see store_check.cpp's comment.
+    std::error_code rm_ec;
+    std::filesystem::remove_all(repo_dir, rm_ec);
     make_dir(repo_dir);
     const std::string packs_dir = repo_dir + "/packs";
     make_dir(packs_dir);

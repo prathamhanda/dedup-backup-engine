@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -40,10 +41,14 @@ int main(int argc, char** argv) {
     const std::string repo_dir = argv[1];
     const int chunk_count = argc >= 3 ? std::atoi(argv[2]) : 200;
 
-    // Plain POSIX mkdir, not std::filesystem — ChunkStore doesn't manage
-    // directories itself, and this tool keeps the same pre-C++17-filesystem
-    // dependency footprint as everything built so far (that arrives in
-    // component 6).
+    // Clear any state left over from a previous run so this tool is
+    // idempotent/repeatable under CTest (component 10) without manual
+    // cleanup between runs -- otherwise a second invocation would append
+    // onto stale data and the round-trip/reopen assertions below could
+    // fail for reasons that have nothing to do with a real regression.
+    std::error_code rm_ec;
+    std::filesystem::remove_all(repo_dir, rm_ec);
+
     make_dir(repo_dir);
     const std::string packs_dir = repo_dir + "/packs";
     make_dir(packs_dir);

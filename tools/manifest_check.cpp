@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <random>
@@ -65,6 +66,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string repo_dir = argv[1];
+    // Idempotent/repeatable under CTest -- see store_check.cpp's comment.
+    std::error_code rm_ec;
+    std::filesystem::remove_all(repo_dir, rm_ec);
     make_dir(repo_dir);
     make_dir(repo_dir + "/snapshots");
     const std::string manifest_path = repo_dir + "/snapshots/20260907-143022.manifest";

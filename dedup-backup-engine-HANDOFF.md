@@ -193,8 +193,11 @@ dedup-backup/
 │   ├── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
 │   ├── wal_check.cpp            # CRC32 self-test + torn-write   [DONE, VERIFIED]
 │   └── manifest_check.cpp       # format round-trip + corruption [DONE, VERIFIED]
-└── tests/
-    └── CMakeLists.txt           # wired up in c10
+└── tests/                        # [DONE, VERIFIED] all 7 pass, twice in a row (idempotent)
+    ├── CMakeLists.txt
+    ├── roundtrip_test.cpp        # real backup+restore, byte-exact + mode bits
+    ├── insertion_identity_test.cpp  # real backup pipeline, proves CDC end-to-end
+    └── crash_recovery_test.sh    # real kill -9 mid-backup via WAL-progress polling
 ```
 
 ### 3.3 On-disk format specifications
@@ -882,6 +885,74 @@ performance. **Corrected §5.1's claim that WSL2 is "fully adequate... including
 numbers"** — it's adequate for correctness (everything else in this doc), not for this specific
 fsync-bound throughput claim. The final resume throughput number needs real hardware; see §5.1 and
 §6.
+
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
+### 4.13 Component 10 — tests `[DONE, VERIFIED]`
+
+All four required tests, plus three of the existing per-component `tools/*_check` binaries
+(store, index, manifest) registered as bonus regression coverage — they already did real
+verification work, so leaving them unregistered would have thrown away free CTest coverage.
+`wal_check` (component 5) already **was** the WAL torn-write test in substance, exactly as flagged
+back in §4.8 — registered directly rather than duplicated.
+
+**`roundtrip_test.cpp` and `insertion_identity_test.cpp` go through the REAL `run_backup()`/
+`run_restore()` pipeline**, not a shortcut through the chunker or store directly. This matters most
+for the insertion-identity test: `tools/chunk_identity.cpp` (components 1-3) already proved
+FastCDC's resync property at the chunker level; this test proves the property survives being
+wrapped in the full stack — dedup check, WAL logging, index update, manifest — end to end, which is
+a materially different (and stronger) claim.
+
+**Insertion-identity threshold is `<=3` new chunks, not `==1`.** The empirical distribution from
+components 1-3 (50/50 pseudorandom trials landing on exactly 1) predicts 1, occasionally 2 from
+documented normalized-chunking second-order effects — 3 leaves margin without loosening the test
+into meaninglessness: fixed-size chunking on the same edit costs hundreds of chunks, so even a
+generous small-N threshold cleanly separates "CDC working" from "CDC broken."
+
+**Crash-recovery test kills on WAL-PROGRESS polling, not a fixed sleep — this was a deliberate
+design correction, not the first thing tried.** A fixed sleep's "mid-backup" window depends
+entirely on fsync latency, which components 9/§4.12 just proved varies by 10-100x between this
+WSL2 environment (~12.4ms/fsync) and real hardware. A fixed sleep tuned for one would be wrong for
+the other — either killing before the process even starts on slow hardware, or well after it
+finishes on fast hardware. Instead the script polls `wal.log`'s size and kills the INSTANT it
+observes any growth past its pre-test-B baseline: proof of real, durable, at-least-one-chunk
+progress, while still being as early as structurally possible — which reliably lands mid-backup
+(not at the very end) as long as the backup covers more than one chunk, regardless of absolute
+fsync speed on whatever machine runs it.
+
+**Crash-recovery test goes beyond the minimum spec on purpose:** beyond "previous snapshot still
+restores correctly" (the literal ask), it also runs `verify` (confirms no corruption anywhere in
+the repo, not just in the one snapshot checked) and then a full, uninterrupted second backup of the
+same source that was interrupted (confirms the repository is actually USABLE after crash recovery,
+not merely non-corrupt — WAL replay-on-reopen has to produce a working state, not just a safe one).
+
+**Idempotency fix applied to all four reused `tools/*_check` binaries**, discovered by actually
+running the suite twice: they never cleaned their scratch directory before running, so a second
+`ctest` invocation without manual cleanup would append onto stale state and could fail for reasons
+unrelated to any real regression. Added `std::filesystem::remove_all()` at the start of each.
+Confirmed by literally running the full suite twice in a row (see transcript below) — not assumed.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08), full suite, twice in a row with
+zero manual cleanup between runs:
+```
+1/7 Test #1: roundtrip ........................   Passed    0.54 sec
+2/7 Test #2: insertion_identity ...............   Passed    5.74 sec
+3/7 Test #3: crash_recovery ...................   Passed    7.48 sec
+4/7 Test #4: wal_torn_write ...................   Passed    0.43 sec
+5/7 Test #5: store_roundtrip ..................   Passed    1.64 sec
+6/7 Test #6: index_dedup ......................   Passed    0.72 sec
+7/7 Test #7: manifest_format ..................   Passed    0.02 sec
+100% tests passed, 0 tests failed out of 7
+```
+(Second run: 100% passed again, 0 failed, no cleanup in between — confirming the idempotency fix.)
+
+One real bug caught and fixed during this component, not before it shipped: the first `ctest` run
+had 4/7 tests fail on `mkdir ... No such type or directory` — the reused check tools' directory
+setup is a single POSIX `mkdir()`, not `mkdir -p`, so a nested scratch path
+(`build/tests/scratch/wal_check`) failed because the intermediate `scratch/` parent didn't exist
+yet. Fixed by flattening every scratch path to a single level directly under
+`CMAKE_CURRENT_BINARY_DIR` (which always exists) rather than adding `mkdir -p` semantics to four
+already-verified tool binaries for a problem that a path choice sidesteps entirely.
 
 Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 

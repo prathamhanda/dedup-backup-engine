@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -75,6 +76,9 @@ int main(int argc, char** argv) {
     }
 
     const std::string repo_dir = argv[1];
+    // Idempotent/repeatable under CTest -- see store_check.cpp's comment.
+    std::error_code rm_ec;
+    std::filesystem::remove_all(repo_dir, rm_ec);
     make_dir(repo_dir);
     const std::string wal_path = repo_dir + "/wal.log";
 
