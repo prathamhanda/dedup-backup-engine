@@ -1,11 +1,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "dedupbackup/backup_pipeline.hpp"
 #include "dedupbackup/repository.hpp"
+#include "dedupbackup/restore_pipeline.hpp"
+#include "dedupbackup/verify.hpp"
 
 using namespace dedupbackup;
 
@@ -81,6 +84,61 @@ int cmd_backup(const Args& args) {
     return 0;
 }
 
+int cmd_restore(const Args& args) {
+    if (args.positional.size() < 2 || args.repo.empty()) {
+        std::fprintf(stderr, "usage: dedup-backup restore <snapshot-id> <dest-dir> --repo <repo-path>\n");
+        return 1;
+    }
+    Repository repo(args.repo);
+    try {
+        const size_t count = run_restore(args.positional[0], args.positional[1], repo);
+        std::printf("restored and verified %zu files from snapshot %s into %s\n", count,
+                    args.positional[0].c_str(), args.positional[1].c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "restore failed: %s\n", e.what());
+        return 1;
+    }
+}
+
+int cmd_verify(const Args& args) {
+    if (args.repo.empty()) {
+        std::fprintf(stderr, "usage: dedup-backup verify --repo <repo-path>\n");
+        return 1;
+    }
+    Repository repo(args.repo);
+    const VerifyReport report = run_verify(repo);
+
+    std::printf("checked %zu snapshots, %zu files, %zu unique chunks (%zu chunk references)\n",
+                report.snapshots_checked, report.files_checked, report.unique_chunks_verified,
+                report.chunk_references_walked);
+
+    if (report.ok()) {
+        std::printf("verify OK: no issues found\n");
+        return 0;
+    }
+
+    std::printf("verify FAILED: %zu issue(s) found\n", report.issues.size());
+    for (const VerifyIssue& issue : report.issues) {
+        std::printf("  [%s]%s%s: %s\n", issue.snapshot_id.c_str(),
+                    issue.file_path.empty() ? "" : " ", issue.file_path.c_str(),
+                    issue.message.c_str());
+    }
+    return 1;
+}
+
+int cmd_list(const Args& args) {
+    if (args.repo.empty()) {
+        std::fprintf(stderr, "usage: dedup-backup list --repo <repo-path>\n");
+        return 1;
+    }
+    Repository repo(args.repo);
+    for (const std::string& id : repo.list_snapshots()) {
+        std::printf("%s\n", id.c_str());
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -94,8 +152,11 @@ int main(int argc, char** argv) {
 
     if (command == "init") return cmd_init(args);
     if (command == "backup") return cmd_backup(args);
+    if (command == "restore") return cmd_restore(args);
+    if (command == "verify") return cmd_verify(args);
+    if (command == "list") return cmd_list(args);
 
-    // list/restore/verify/stats/bench land in components 8-9.
+    // stats/bench land in component 9.
     std::fprintf(stderr, "dedup-backup: subcommand '%s' not implemented yet\n", command.c_str());
     return 1;
 }

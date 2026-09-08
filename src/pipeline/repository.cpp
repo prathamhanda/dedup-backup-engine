@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -76,6 +77,21 @@ Manifest Repository::read_snapshot_manifest(const std::string& snapshot_id) cons
 bool Repository::has_snapshot(const std::string& snapshot_id) const {
     std::error_code ec;
     return std::filesystem::exists(repo_path_ + "/snapshots/" + snapshot_id + ".manifest", ec);
+}
+
+std::vector<std::string> Repository::list_snapshots() const {
+    std::vector<std::string> ids;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(repo_path_ + "/snapshots", ec)) {
+        if (!entry.is_regular_file()) continue;
+        const std::filesystem::path& p = entry.path();
+        if (p.extension() == ".manifest") {
+            ids.push_back(p.stem().string());
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
 }
 
 } // namespace dedupbackup

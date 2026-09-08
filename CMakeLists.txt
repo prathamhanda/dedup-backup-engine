@@ -30,6 +30,8 @@ add_library(dedupbackup_core STATIC
     src/manifest/manifest.cpp
     src/pipeline/repository.cpp
     src/pipeline/backup_pipeline.cpp
+    src/pipeline/restore_pipeline.cpp
+    src/pipeline/verify.cpp
 )
 target_include_directories(dedupbackup_core PUBLIC include)
 target_link_libraries(dedupbackup_core PUBLIC OpenSSL::Crypto Threads::Threads)

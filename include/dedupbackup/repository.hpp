@@ -57,6 +57,10 @@ public:
     Manifest read_snapshot_manifest(const std::string& snapshot_id) const;
     bool has_snapshot(const std::string& snapshot_id) const;
 
+    // All snapshot ids present in the repo, sorted ascending — which is
+    // also chronological order, since ids are "YYYYMMDD-HHMMSS".
+    std::vector<std::string> list_snapshots() const;
+
     const std::string& path() const { return repo_path_; }
 
 private:

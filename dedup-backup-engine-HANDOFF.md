@@ -169,6 +169,8 @@ dedup-backup/
 │   ├── manifest.hpp             # ManifestFileEntry, Manifest     [DONE, VERIFIED]
 │   ├── bounded_queue.hpp        # BoundedQueue<T>                 [DONE, VERIFIED]
 │   ├── backup_pipeline.hpp      # BackupOptions, run_backup       [DONE, VERIFIED]
+│   ├── restore_pipeline.hpp     # run_restore                     [DONE, VERIFIED]
+│   ├── verify.hpp               # VerifyIssue, VerifyReport, run_verify [DONE, VERIFIED]
 │   └── repository.hpp           # ties store+index+wal together  [DONE, VERIFIED — built as
 │                                 #   part of c7, not c3; see §4.10]
 ├── src/
@@ -178,9 +180,10 @@ dedup-backup/
 │   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
 │   ├── wal/wal.cpp                                                [DONE, VERIFIED]
 │   ├── manifest/manifest.cpp                                     [DONE, VERIFIED]
-│   └── pipeline/repository.cpp, backup_pipeline.cpp              [DONE, VERIFIED]
-│   └── main.cpp                 # CLI: init, backup implemented; list/restore/verify/stats/bench
-│                                 #      remain [TODO c8/c9]
+│   ├── pipeline/repository.cpp, backup_pipeline.cpp              [DONE, VERIFIED]
+│   ├── pipeline/restore_pipeline.cpp, verify.cpp                 [DONE, VERIFIED]
+│   └── main.cpp                 # CLI: init, backup, restore, verify, list implemented;
+│                                 #      stats/bench remain [TODO c9]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
@@ -725,6 +728,82 @@ Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0 (one real wa
 was fixed during this component — `-Wformat-truncation` on the snapshot-id `snprintf`, GCC
 reasoning conservatively about `%d`'s theoretical worst case; fixed by sizing the buffer for that
 worst case rather than suppressing the warning).
+
+### 4.11 Component 8 — restore and verify `[DONE, VERIFIED]`
+
+`run_restore()` and `run_verify()`, plus real `restore`/`verify`/`list` subcommands in `main.cpp`
+(`list` pulled forward from component 9 — it's a two-line wrapper around `Repository::
+list_snapshots()`, already needed internally by `verify`, and made every test in this component
+far more natural to run without hardcoding snapshot ids).
+
+**Restore is deliberately single-threaded, unlike backup.** No resume claim rests on restore
+throughput, and a plain sequential loop removes an entire class of possible concurrency bugs from
+the one operation whose entire job is "produce exactly the right bytes." A scope decision, stated
+explicitly rather than left to look like an oversight.
+
+**Restore fails fast and loud on any corruption; verify collects every issue instead.** Different
+jobs, different failure philosophy, both deliberate: restore's purpose is handing back correct
+bytes right now, so the first missing chunk or digest mismatch throws immediately, naming the file
+— a restore that silently returns partially-wrong data is worse than one that refuses outright.
+Verify's purpose is a full health report, so one bad chunk gets recorded as an issue and checking
+continues over the rest of the repository, rather than stopping at the first problem found.
+
+**Verify re-hashes each unique chunk once per run, not once per reference.** A chunk shared by
+many files/snapshots would otherwise be re-read and re-hashed once per reference — on a
+heavily-deduped real repository (the whole point of this project) that's a large multiplier for
+zero additional signal, since a chunk's bytes don't change between references. A local
+`std::unordered_set<Digest, DigestHash>` of already-verified digests within one `run_verify()`
+call closes that gap; this is also why `VerifyReport` tracks `chunk_references_walked` (every
+reference visited) separately from `unique_chunks_verified` (distinct chunks actually re-hashed).
+
+**Restore's whole-file digest check is genuinely independent of chunk-level verification** — this
+is why `reassemble()` doesn't re-check each chunk's own digest as it fetches it (that's `verify`'s
+job, at a different granularity); restore trusts the index's location lookup and instead validates
+the *end result*, which is what actually matters for restore's contract. Confirmed this is a real,
+not just theoretical, safety net: hand-corrupting one byte in the pack file (see below) was caught
+by restore's whole-file digest mismatch even though restore never separately checks the corrupted
+chunk's own digest.
+
+**`chmod`/`mtime` restored via POSIX `chmod()`/`utime()`, masking `entry.mode` to the low 12 bits
+(`& 07777`)** before passing it to `chmod()` — `st_mode` (what the manifest stores) also carries
+file-type bits like `S_IFREG` in its upper bits, which `chmod()` doesn't want and isn't meant to
+receive.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08), several real scenarios against
+the actual CLI, not standalone tools:
+
+*Clean round-trip* (3 files including a nested subdirectory and a non-default mode):
+```
+snapshot: 20260908-143145
+restored and verified 3 files from snapshot 20260908-143145 into /tmp/rt_out
+DIFF: IDENTICAL          (diff -r against the original source tree)
+640 /tmp/rt_src/small.txt
+640 /tmp/rt_out/small.txt   (mode bit preserved exactly)
+checked 1 snapshots, 3 files, 42 unique chunks (42 chunk references)
+verify OK: no issues found
+```
+
+*Corruption detection — caught independently by both commands*, after hand-flipping one byte in
+the pack file at a known offset:
+```
+=== verify ===
+checked 1 snapshots, 3 files, 41 unique chunks (42 chunk references)
+verify FAILED: 1 issue(s) found
+  [20260908-143145] sub/nested.bin: chunk 0c9de96e...fea42 content does not hash to its own
+  address (recomputed e74dfc46...4d73d5) -- pack file corruption
+
+=== restore ===
+restore failed: restore: VERIFICATION FAILED for 'sub/nested.bin': recomputed digest
+0964972c...b794d8b does not match manifest digest cc1f5ae1...82b0b957 -- the restored bytes do
+not match what was backed up
+(exit code: 1 for both)
+```
+Note `unique_chunks_verified` dropping to 41/42 after corruption — exactly the corrupted chunk is
+excluded from the "verified good" count while still being visited (`chunk_references_walked`
+stays 42), matching the design: a corrupt chunk is never marked checked, so it would be reported
+again on a future verify run rather than silently passing.
+
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
 **Known limitation, honestly scoped, not yet built:** no per-file skip-if-unchanged optimization —
 every backup re-reads, re-chunks, and re-hashes every file it walks, regardless of mtime. The
