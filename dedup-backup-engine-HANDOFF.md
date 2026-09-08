@@ -163,7 +163,7 @@ dedup-backup/
 │   ├── hasher.hpp               # IHasher, Digest, to_hex        [DONE]
 │   ├── sha256_hasher.hpp        #                                [DONE, VERIFIED]
 │   ├── chunk_store.hpp          # ChunkLocation, ChunkStore       [DONE, VERIFIED]
-│   ├── chunk_index.hpp          #                                [TODO c4]
+│   ├── chunk_index.hpp          # DigestHash, ChunkIndex          [DONE, VERIFIED]
 │   ├── wal.hpp                  #                                [TODO c5]
 │   ├── manifest.hpp             #                                [TODO c6]
 │   ├── thread_pool.hpp          #                                [TODO c7]
@@ -172,12 +172,14 @@ dedup-backup/
 │   ├── chunker/{fastcdc_chunker,fixed_chunker}.cpp               [DONE]
 │   ├── hasher/sha256_hasher.cpp                                  [DONE, VERIFIED]
 │   ├── store/chunk_store.cpp                                     [DONE, VERIFIED]
-│   ├── index/…  wal/…  manifest/…  pipeline/…                    [TODO]
+│   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
+│   ├── wal/…  manifest/…  pipeline/…                             [TODO]
 │   └── main.cpp                 # CLI                            [STUB]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
-│   └── store_check.cpp          # pack-file round-trip + reopen  [DONE, VERIFIED]
+│   ├── store_check.cpp          # pack-file round-trip + reopen  [DONE, VERIFIED]
+│   └── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
 └── tests/
     └── CMakeLists.txt           # wired up in c10
 ```
@@ -481,6 +483,42 @@ this is why the WAL never trusts a pack file offset it hasn't itself durably rec
 or torn chunk at the tail of the pack file, from a chunk whose WAL record never got written, is
 simply never referenced by anything and is harmless. Verifying that end-to-end is component 5's
 crash-recovery test, not this component's.
+
+### 4.7 Component 4 — chunk index `[DONE, VERIFIED]`
+
+`ChunkIndex` is a thin wrapper over `std::unordered_map<Digest, ChunkLocation, DigestHash>` — the
+whole answer to "do we already have this chunk?" Two decisions worth being able to defend:
+
+**Hash function truncates the digest instead of re-hashing it.** `Digest` is already a SHA-256
+output — uniformly-distributed, cryptographically strong bits by construction. `DigestHash` just
+takes the first 8 bytes as a `size_t`. Re-hashing with `std::hash`/FNV on top would throw away
+hash quality for no benefit. The key distinction: a hash-*table* collision (two digests landing
+in the same bucket) is harmless, resolved by chaining — a totally different concern from a
+*cryptographic* collision (two different chunks producing the same digest), which would actually
+corrupt the store. Truncating is safe for the former even though it would be catastrophic for the
+latter. Same pattern used by restic, Borg, ZFS dedup.
+
+**No persistence of its own, no internal locking — both deliberate.** Persistence is the WAL's
+job (component 5): on startup, replay every valid WAL record and call `insert()` for each — the
+index is a pure derived structure, never itself the source of truth, so there's no separate index
+file that could get out of sync with the WAL. Locking is the caller's job (§3.5's single global
+mutex around the whole "check index, store bytes, write WAL, update index" sequence) — adding a
+second lock inside `ChunkIndex` would be redundant at best.
+
+**Verified on Linux** (`tools/index_check.cpp`, WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08): the
+first end-to-end rehearsal of the actual dedup decision (`hash → contains? → skip : store+insert`)
+across all three components built so far (hasher, store, index). 300 synthetic logical chunks (100
+unique + 200 exact re-uses of earlier ones) processed; verified the index landed on exactly 100
+unique entries, exercised full round-trip recovery (index.find + store.read) for all 300 —
+including the 200 that were dedup hits and never separately stored — and confirmed every one
+produced byte-identical content back. Real transcript:
+```
+processed 300 logical chunks: 200 dedup hits, 100 newly stored
+index size (unique chunks): 100
+logical bytes: 9627507, physical bytes stored: 3150137, saved: 67.3%
+round-trip OK: all 300 logical chunks resolve to correct bytes via the index
+```
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
 ---
 
