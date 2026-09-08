@@ -79,6 +79,26 @@ bool Repository::has_snapshot(const std::string& snapshot_id) const {
     return std::filesystem::exists(repo_path_ + "/snapshots/" + snapshot_id + ".manifest", ec);
 }
 
+ChunkSizeStats Repository::compute_chunk_size_stats() const {
+    std::vector<uint32_t> sizes;
+    sizes.reserve(index_.size());
+    uint64_t total = 0;
+    for (const auto& kv : index_) {
+        sizes.push_back(kv.second.length);
+        total += kv.second.length;
+    }
+
+    ChunkSizeStats stats;
+    stats.physical_bytes = total;
+    stats.unique_chunks = sizes.size();
+    if (!sizes.empty()) {
+        stats.mean_chunk_size = static_cast<double>(total) / static_cast<double>(sizes.size());
+        std::sort(sizes.begin(), sizes.end());
+        stats.median_chunk_size = sizes[sizes.size() / 2];
+    }
+    return stats;
+}
+
 std::vector<std::string> Repository::list_snapshots() const {
     std::vector<std::string> ids;
     std::error_code ec;

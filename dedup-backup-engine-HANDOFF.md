@@ -182,8 +182,10 @@ dedup-backup/
 │   ├── manifest/manifest.cpp                                     [DONE, VERIFIED]
 │   ├── pipeline/repository.cpp, backup_pipeline.cpp              [DONE, VERIFIED]
 │   ├── pipeline/restore_pipeline.cpp, verify.cpp                 [DONE, VERIFIED]
-│   └── main.cpp                 # CLI: init, backup, restore, verify, list implemented;
-│                                 #      stats/bench remain [TODO c9]
+│   ├── stats/stats.cpp                                            [DONE, VERIFIED]
+│   └── main.cpp                 # CLI: init, backup, restore, verify, list, stats, bench —
+│                                 #      every subcommand implemented. Only tests (c10) and
+│                                 #      README (c11) remain.
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
@@ -729,6 +731,13 @@ was fixed during this component — `-Wformat-truncation` on the snapshot-id `sn
 reasoning conservatively about `%d`'s theoretical worst case; fixed by sizing the buffer for that
 worst case rather than suppressing the warning).
 
+**Known limitation, honestly scoped, not yet built:** no per-file skip-if-unchanged optimization —
+every backup re-reads, re-chunks, and re-hashes every file it walks, regardless of mtime. The
+chunk-level dedup in `Repository::store_chunk_if_absent()` still prevents re-storing identical
+bytes (confirmed above: an unchanged re-backup added zero new chunks), so correctness and disk
+usage are unaffected — this only costs CPU/IO on files that didn't change. Not in the reduced
+scope (§2.2); worth naming as a "what would you do next" answer.
+
 ### 4.11 Component 8 — restore and verify `[DONE, VERIFIED]`
 
 `run_restore()` and `run_verify()`, plus real `restore`/`verify`/`list` subcommands in `main.cpp`
@@ -805,12 +814,76 @@ again on a future verify run rather than silently passing.
 
 Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
-**Known limitation, honestly scoped, not yet built:** no per-file skip-if-unchanged optimization —
-every backup re-reads, re-chunks, and re-hashes every file it walks, regardless of mtime. The
-chunk-level dedup in `Repository::store_chunk_if_absent()` still prevents re-storing identical
-bytes (confirmed above: an unchanged re-backup added zero new chunks), so correctness and disk
-usage are unaffected — this only costs CPU/IO on files that didn't change. Not in the reduced
-scope (§2.2); worth naming as a "what would you do next" answer.
+### 4.12 Component 9 — stats and bench `[DONE, VERIFIED — throughput number is WSL2-invalid, see below]`
+
+`RepoStats`/`compute_stats()` (logical/physical bytes, dedup %, dedup factor, unique chunks,
+mean/median chunk size) and `PipelineTimings` threaded optionally through `run_backup()` for a
+per-phase time breakdown, plus real `stats`/`bench` subcommands.
+
+**`PipelineTimings` is opt-in via a nullable pointer, not a flag checked per-operation**, so the
+normal `backup` command pays zero cost for instrumentation it isn't using — `clock::now()` is only
+ever called via `timings ? clock::now() : clock::time_point{}`, so with `timings == nullptr` the
+ternary never evaluates the clock call at all, not even a wasted timestamp read.
+
+**Phase times are aggregated ACROSS ALL WORKER THREADS, explicitly labeled as such.** A
+fully-parallel phase's reported time is roughly `thread_count × wall_time`, not wall time itself —
+documented prominently in both the header comment and the CLI output itself, specifically so this
+never gets misread as "phases should sum to the wall-clock total" (they don't, deliberately).
+
+**`store_ns` timing wraps the ENTIRE `store_chunk_if_absent()` call, including time spent blocked
+waiting for the single global mutex** — not just the fsync/append work once the lock is held. This
+is deliberate: under contention, most of a worker's "time in store" *is* mutex wait, and that's
+exactly the secondary-bottleneck signal §3.5 predicted worth surfacing, not something to hide by
+measuring only the critical section.
+
+**`Repository::compute_chunk_size_stats()` computes physical bytes/count/mean/median in one pass**
+or over the index, returned as a single struct — an intentional choice so `stats` gets one
+internally-consistent snapshot of the index rather than several separately-timed passes that could
+observe the index at slightly different states in a future concurrent-read scenario.
+
+**`list` was actually built in component 8**, ahead of this component's official scope — noted
+there already; `stats`/`bench` are what's newly added here.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08) — `stats` against a real repo
+with genuine duplicate content and an incremental edit across two snapshots:
+```
+snapshots:          2
+logical bytes:      9010024
+physical bytes:     2511674
+dedup saved:        72.1% (3.59x)
+unique chunks:      272
+mean chunk size:    9234 bytes
+median chunk size:  9051 bytes
+```
+Internally consistent with component 7's per-backup chunk counts (266 then 267 unique chunks
+observed there — this repo's two-snapshot total of 272 is in the right range given the extra edit
+applied since).
+
+**`bench` surfaced a real, important environment finding, not a code bug — read this before
+trusting any throughput number from this machine:**
+```
+bench: snapshot ..., 4 files, 4.3 MB logical, 14.71s wall
+sustained throughput: 0.3 MB/s
+  file I/O:       0.02s
+  chunking:       0.00s
+  hashing:        0.02s
+  store+wal:      35.97s  (single global mutex -- known secondary bottleneck)
+```
+0.3 MB/s and ~36s of aggregate fsync-bound time for roughly 500 chunks is wildly disproportionate
+next to healthy sub-0.1s chunking/hashing numbers on the same data. Isolated with a standalone C
+program (no project code at all — just `open`/`write`/`fsync` in a loop): **~12.4ms per `fsync()`
+call on this WSL2 filesystem**, roughly 10-100x slower than typical bare-metal SSD fsync latency.
+This project's WAL fsyncs on every newly-stored chunk (by design — §1.4's crash-safety guarantee
+depends on it), so a fsync-bound workload is exactly the case WSL2's virtualized disk stack
+distorts hardest. This is a genuine, useful diagnostic result — `bench`'s phase breakdown correctly
+identified `store+wal` as the dominant cost, which is TRUE and real for this environment — but the
+absolute throughput number is an artifact of WSL2, not a measurement of the engine's real
+performance. **Corrected §5.1's claim that WSL2 is "fully adequate... including for benchmark
+numbers"** — it's adequate for correctness (everything else in this doc), not for this specific
+fsync-bound throughput claim. The final resume throughput number needs real hardware; see §5.1 and
+§6.
+
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
 ---
 
@@ -818,8 +891,17 @@ scope (§2.2); worth naming as a "what would you do next" answer.
 
 ### 5.1 Environment (blocking everything)
 
-WSL2 on Windows 11 is a real Linux kernel — real `fsync`, real ext4, real `std::filesystem` —
-and is fully adequate, including for benchmark numbers.
+WSL2 on Windows 11 is a real Linux kernel — real `fsync`, real ext4, real `std::filesystem` — and
+is fully adequate for correctness verification (every component 1-9 write-up in this doc is a real
+transcript from exactly this setup). **Correction, found empirically in component 9 (§4.12): it is
+NOT adequate for the final throughput number specifically.** Isolated `fsync()` in a standalone C
+program (no project code involved) on this WSL2 setup: ~12.4ms/call, roughly 10-100x slower than
+typical bare-metal SSD fsync latency — almost certainly WSL2's virtualized disk stack, not
+anything wrong with the code. This project's WAL fsyncs on every chunk store, so a fsync-bound
+workload is exactly the case WSL2 distorts hardest. `chunking`/`hashing`/`file I/O` phases were
+all fast and healthy in the same test; only `store+wal` (which is dominated by fsync) was
+inflated. **The final `bench` numbers for the resume/README MUST come from real hardware**, not
+this WSL2 setup — everything else (correctness, the whole build-and-verify story) stands as-is.
 
 PowerShell as Administrator:
 ```powershell

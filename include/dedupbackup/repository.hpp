@@ -11,6 +11,13 @@
 
 namespace dedupbackup {
 
+struct ChunkSizeStats {
+    uint64_t physical_bytes = 0;
+    size_t unique_chunks = 0;
+    double mean_chunk_size = 0.0;
+    uint64_t median_chunk_size = 0;
+};
+
 // Ties ChunkStore + ChunkIndex + Wal together into the one object the
 // backup pipeline actually talks to. This is where §3.5's "single global
 // mutex" lives: rather than have pipeline/worker code manage a shared
@@ -60,6 +67,14 @@ public:
     // All snapshot ids present in the repo, sorted ascending — which is
     // also chronological order, since ids are "YYYYMMDD-HHMMSS".
     std::vector<std::string> list_snapshots() const;
+
+    // Physical storage stats derived from the index in one pass: total
+    // bytes actually stored (unique chunks only), count, mean/median
+    // chunk size. Returned as one struct (rather than several separate
+    // accessors) so `stats` gets a single, internally-consistent
+    // snapshot of the index instead of computing each field from a
+    // separately-timed pass.
+    ChunkSizeStats compute_chunk_size_stats() const;
 
     const std::string& path() const { return repo_path_; }
 

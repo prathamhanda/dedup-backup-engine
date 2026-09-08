@@ -88,9 +88,20 @@ void walker_loop(fs::path root, BoundedQueue<fs::path>& queue) {
 // after construction — not because of any locking.
 void worker_loop(BoundedQueue<fs::path>& queue, const fs::path& root, Repository& repo,
                   const IChunker& chunker, const Sha256Hasher& hasher,
-                  std::vector<ManifestFileEntry>& manifest_files, std::mutex& manifest_mutex) {
+                  std::vector<ManifestFileEntry>& manifest_files, std::mutex& manifest_mutex,
+                  PipelineTimings* timings) {
+    using clock = std::chrono::steady_clock;
+    // Local (non-atomic) accumulators, flushed into `timings` once per
+    // file rather than once per chunk -- avoids atomic contention on
+    // every single chunk when several worker threads are timing
+    // concurrently. Unused (and clock::now() never called) when
+    // `timings` is null, so the normal `backup` path pays nothing for
+    // this instrumentation.
+    uint64_t local_read_ns = 0, local_chunk_ns = 0, local_hash_ns = 0, local_store_ns = 0;
+
     fs::path path;
     while (queue.pop(path)) {
+        const auto t_read0 = timings ? clock::now() : clock::time_point{};
         std::ifstream f(path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "worker: failed to open %s, skipping\n", path.string().c_str());
@@ -99,14 +110,23 @@ void worker_loop(BoundedQueue<fs::path>& queue, const fs::path& root, Repository
         std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
                                    std::istreambuf_iterator<char>());
         f.close();
+        if (timings) local_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_read0).count();
 
+        const auto t_chunk0 = timings ? clock::now() : clock::time_point{};
         const std::vector<ChunkSpan> spans = chunker.chunk(data.data(), data.size());
+        if (timings) local_chunk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_chunk0).count();
 
         std::vector<Digest> chunk_digests;
         chunk_digests.reserve(spans.size());
         for (const ChunkSpan& span : spans) {
+            const auto t_hash0 = timings ? clock::now() : clock::time_point{};
             const Digest digest = hasher.hash(data.data() + span.offset, span.length);
+            if (timings) local_hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_hash0).count();
+
+            const auto t_store0 = timings ? clock::now() : clock::time_point{};
             repo.store_chunk_if_absent(digest, data.data() + span.offset, span.length);
+            if (timings) local_store_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_store0).count();
+
             chunk_digests.push_back(digest);
         }
 
@@ -119,7 +139,9 @@ void worker_loop(BoundedQueue<fs::path>& queue, const fs::path& root, Repository
         // The cost is real (~2x total hashing bytes vs. chunk digests
         // alone) and is a deliberate correctness-over-throughput
         // tradeoff, not an oversight — see README.
+        const auto t_fhash0 = timings ? clock::now() : clock::time_point{};
         const Digest file_digest = hasher.hash(data.data(), data.size());
+        if (timings) local_hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_fhash0).count();
 
         struct stat st{};
         uint32_t mode = 0;
@@ -147,6 +169,13 @@ void worker_loop(BoundedQueue<fs::path>& queue, const fs::path& root, Repository
 
         std::lock_guard<std::mutex> lock(manifest_mutex);
         manifest_files.push_back(std::move(entry));
+    }
+
+    if (timings) {
+        timings->read_ns += local_read_ns;
+        timings->chunk_ns += local_chunk_ns;
+        timings->hash_ns += local_hash_ns;
+        timings->store_ns += local_store_ns;
     }
 }
 
@@ -196,7 +225,7 @@ std::string run_backup(const std::string& source_dir, Repository& repo,
     for (size_t i = 0; i < thread_count; ++i) {
         workers.emplace_back(worker_loop, std::ref(queue), std::cref(root), std::ref(repo),
                               std::cref(*chunker), std::cref(hasher), std::ref(manifest_files),
-                              std::ref(manifest_mutex));
+                              std::ref(manifest_mutex), options.timings);
     }
 
     walker.join();
