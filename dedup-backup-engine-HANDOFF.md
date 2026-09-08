@@ -167,8 +167,10 @@ dedup-backup/
 │   ├── wal.hpp                  # Wal, WalRecordType, crc32       [DONE, VERIFIED]
 │   ├── byte_io.hpp              # LE read/write helpers           [DONE, VERIFIED]
 │   ├── manifest.hpp             # ManifestFileEntry, Manifest     [DONE, VERIFIED]
-│   ├── thread_pool.hpp          #                                [TODO c7]
-│   └── repository.hpp           # ties store+index+wal together  [TODO c3]
+│   ├── bounded_queue.hpp        # BoundedQueue<T>                 [DONE, VERIFIED]
+│   ├── backup_pipeline.hpp      # BackupOptions, run_backup       [DONE, VERIFIED]
+│   └── repository.hpp           # ties store+index+wal together  [DONE, VERIFIED — built as
+│                                 #   part of c7, not c3; see §4.10]
 ├── src/
 │   ├── chunker/{fastcdc_chunker,fixed_chunker}.cpp               [DONE]
 │   ├── hasher/sha256_hasher.cpp                                  [DONE, VERIFIED]
@@ -176,8 +178,9 @@ dedup-backup/
 │   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
 │   ├── wal/wal.cpp                                                [DONE, VERIFIED]
 │   ├── manifest/manifest.cpp                                     [DONE, VERIFIED]
-│   └── pipeline/…                                                [TODO]
-│   └── main.cpp                 # CLI                            [STUB]
+│   └── pipeline/repository.cpp, backup_pipeline.cpp              [DONE, VERIFIED]
+│   └── main.cpp                 # CLI: init, backup implemented; list/restore/verify/stats/bench
+│                                 #      remain [TODO c8/c9]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
@@ -627,6 +630,108 @@ corruption detection OK: bad magic correctly rejected
 corruption detection OK: truncated manifest correctly rejected
 ```
 Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
+### 4.10 Component 7 — thread pool, directory walk, and the first real `backup` `[DONE, VERIFIED]`
+
+Ties every prior component together into an actual working `dedup-backup init` / `dedup-backup
+backup`. This is where `std::filesystem` genuinely enters the codebase (the correction from §5.2)
+via `std::filesystem::recursive_directory_iterator` in the walker thread — the manifest format
+itself (component 6) never needed it.
+
+**`BoundedQueue<T>`** (`bounded_queue.hpp`, header-only template): `push()` blocks while full,
+`pop()` blocks while empty, plain `std::mutex` + two `std::condition_variable`s, no lock-free
+structure per the project's constraints. This is the entire backpressure design: one walker thread
+pushes file paths (capacity 256, per §3.5), N worker threads pop them; if workers fall behind, the
+queue fills and the walker blocks, so a huge source tree can never cause the walker to buffer an
+unbounded number of pending paths.
+
+**`Repository`** (`repository.hpp`/`.cpp`) ties `ChunkStore` + `ChunkIndex` + `Wal` together and
+owns the single global mutex from §3.5. Its one synchronized entry point,
+`store_chunk_if_absent()`, performs check-index / store-bytes-with-fsync / log-WAL-with-fsync /
+update-index atomically — worker threads never touch a mutex directly, they just call this method.
+Originally mis-scoped as component 3 in the early plan (before the index/WAL it ties together
+existed); built here, where it actually belongs.
+
+**Sharing one `Sha256Hasher` and one chunker instance across all worker threads, not one per
+thread** — deliberate, and safe for a specific, checkable reason rather than assumption:
+`Sha256Hasher::hash()` creates and destroys its own `EVP_MD_CTX` inside the call (verified by
+re-reading `sha256_hasher.cpp` — no member state at all), and `FastCDCChunker`/`FixedChunker` set
+their members once at construction and never mutate them afterward, with `chunk()` a `const`
+method touching only locals plus a function-local `static const` gear table (thread-safe init via
+"magic statics", read-only after). Both are safe to share concurrently because they hold no
+mutable state post-construction — not because of any added locking.
+
+**Whole-file digest costs a genuine second pass over the data — not an oversight.** Per-chunk
+digests only prove each chunk's own bytes are intact in isolation; they don't prove the chunks
+were concatenated in the right order during restore. An independent whole-file SHA-256 is an
+end-to-end check that would catch a reassembly/ordering bug the per-chunk digests alone couldn't.
+The cost is real — total hashing work is ~2x what chunk digests alone would need, since every byte
+of the file gets hashed once as part of its chunk and once again as part of the whole-file digest
+— and is named explicitly here as a deliberate correctness-over-throughput tradeoff, not
+discovered later as a performance surprise.
+
+**`mode`/`mtime` come from POSIX `stat()`, not `std::filesystem::last_write_time()`**, even though
+`std::filesystem` is already in use for the walk. `last_write_time()` returns a
+`std::filesystem::file_time_type`, and converting that to a plain Unix-epoch `time_t` has no
+portable, well-defined path before C++20's `clock_cast` — `stat()`'s `st_mtime` is already exactly
+the `time_t` the manifest format wants, with no conversion question at all. `std::filesystem` earns
+its place here specifically for the recursive walk, which it's genuinely good at; it isn't used
+for jobs a simpler, more direct POSIX call already does better.
+
+**A real bug, found empirically, not theorized — and fixed:** snapshot ids have one-second
+resolution (`"YYYYMMDD-HHMMSS"`). The very first real two-backups-in-a-row test against this
+project's own source tree produced two identical snapshot ids (both `20260908-101219`), and the
+second `write_manifest()` call — which truncates-and-overwrites — silently destroyed the first
+snapshot's manifest. Content happened to be unchanged between those two test runs, so nothing was
+actually lost that time, but had the source changed in between, the first snapshot would have
+become permanently unrecoverable with no error of any kind. Fixed by having `run_backup()` check
+`Repository::has_snapshot()` before writing and retry (sleeping up to 5 seconds) rather than ever
+silently overwrite an existing manifest; failing loudly after 5 straight collisions rather than
+looping forever. Deliberately didn't change the on-disk snapshot-id format (already spec'd and
+shipped in component 6) to add a disambiguator — the collision window is sub-second and this
+project's realistic usage pattern (manual or scripted, not sub-second-repeated) makes the retry
+cost negligible in practice. **This is exactly the kind of thing worth volunteering in an
+interview**, per the working agreement's spirit: a real correctness bug this project's own testing
+caught before it caused real data loss, not a bug someone else found.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08) — the first real end-to-end runs
+of the actual `dedup-backup` binary:
+
+*Same-content re-backup* (against this project's own `src/`, twice, back to back):
+```
+snapshot 20260908-101354.manifest created (10 files) — 15 unique chunks
+snapshot 20260908-101355.manifest created (10 files) — 15 unique chunks   (distinct id, both
+                                                                            manifests intact —
+                                                                            the collision fix
+                                                                            working correctly)
+```
+
+*Real dedup demonstration* (4 files: a 2 MB random file, an exact byte-for-byte duplicate of it in
+a subdirectory, a small text file, a 500 KB random file; then a realistic edit — 10 KB appended to
+the 2 MB file, simulating a growing log — before a second backup):
+```
+=== backup 1 ===
+snapshot 20260908-101412 created (4 files) — 266 unique chunks
+=== backup 2 (one file appended to) ===
+snapshot 20260908-101413 created (4 files) — 267 unique chunks
+```
+The exact-duplicate file contributed **zero** new chunks in backup 1 (fully deduped against its
+twin). Appending 10 KB to a 2 MB file grew the unique chunk count by exactly **1** — the same
+single-chunk resync behavior proven analytically in §4.4 and empirically in §4.3, now observed
+through the real end-to-end pipeline rather than the standalone `chunk_identity` tool. Both
+snapshots' manifests remain distinct and intact on disk.
+
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0 (one real warning surfaced and
+was fixed during this component — `-Wformat-truncation` on the snapshot-id `snprintf`, GCC
+reasoning conservatively about `%d`'s theoretical worst case; fixed by sizing the buffer for that
+worst case rather than suppressing the warning).
+
+**Known limitation, honestly scoped, not yet built:** no per-file skip-if-unchanged optimization —
+every backup re-reads, re-chunks, and re-hashes every file it walks, regardless of mtime. The
+chunk-level dedup in `Repository::store_chunk_if_absent()` still prevents re-storing identical
+bytes (confirmed above: an unchanged re-backup added zero new chunks), so correctness and disk
+usage are unaffected — this only costs CPU/IO on files that didn't change. Not in the reduced
+scope (§2.2); worth naming as a "what would you do next" answer.
 
 ---
 

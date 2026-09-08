@@ -12,6 +12,8 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 find_package(OpenSSL REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Core library: every piece of logic except main(). main.cpp is kept separate
@@ -26,9 +28,11 @@ add_library(dedupbackup_core STATIC
     src/index/chunk_index.cpp
     src/wal/wal.cpp
     src/manifest/manifest.cpp
+    src/pipeline/repository.cpp
+    src/pipeline/backup_pipeline.cpp
 )
 target_include_directories(dedupbackup_core PUBLIC include)
-target_link_libraries(dedupbackup_core PUBLIC OpenSSL::Crypto)
+target_link_libraries(dedupbackup_core PUBLIC OpenSSL::Crypto Threads::Threads)
 
 add_executable(dedup-backup src/main.cpp)
 target_link_libraries(dedup-backup PRIVATE dedupbackup_core)
