@@ -25,6 +25,7 @@ add_library(dedupbackup_core STATIC
     src/store/chunk_store.cpp
     src/index/chunk_index.cpp
     src/wal/wal.cpp
+    src/manifest/manifest.cpp
 )
 target_include_directories(dedupbackup_core PUBLIC include)
 target_link_libraries(dedupbackup_core PUBLIC OpenSSL::Crypto)
@@ -46,6 +47,9 @@ target_link_libraries(index_check PRIVATE dedupbackup_core)
 
 add_executable(wal_check tools/wal_check.cpp)
 target_link_libraries(wal_check PRIVATE dedupbackup_core)
+
+add_executable(manifest_check tools/manifest_check.cpp)
+target_link_libraries(manifest_check PRIVATE dedupbackup_core)
 
 enable_testing()
 add_subdirectory(tests)

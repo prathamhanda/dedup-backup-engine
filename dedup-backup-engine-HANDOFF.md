@@ -166,7 +166,7 @@ dedup-backup/
 │   ├── chunk_index.hpp          # DigestHash, ChunkIndex          [DONE, VERIFIED]
 │   ├── wal.hpp                  # Wal, WalRecordType, crc32       [DONE, VERIFIED]
 │   ├── byte_io.hpp              # LE read/write helpers           [DONE, VERIFIED]
-│   ├── manifest.hpp             #                                [TODO c6]
+│   ├── manifest.hpp             # ManifestFileEntry, Manifest     [DONE, VERIFIED]
 │   ├── thread_pool.hpp          #                                [TODO c7]
 │   └── repository.hpp           # ties store+index+wal together  [TODO c3]
 ├── src/
@@ -175,14 +175,16 @@ dedup-backup/
 │   ├── store/chunk_store.cpp                                     [DONE, VERIFIED]
 │   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
 │   ├── wal/wal.cpp                                                [DONE, VERIFIED]
-│   ├── manifest/…  pipeline/…                                    [TODO]
+│   ├── manifest/manifest.cpp                                     [DONE, VERIFIED]
+│   └── pipeline/…                                                [TODO]
 │   └── main.cpp                 # CLI                            [STUB]
 ├── tools/
 │   ├── chunk_stats.cpp          # chunk-size distribution        [DONE]
 │   ├── chunk_identity.cpp       # dedup identity + resync dist.  [DONE, VERIFIED]
 │   ├── store_check.cpp          # pack-file round-trip + reopen  [DONE, VERIFIED]
 │   ├── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
-│   └── wal_check.cpp            # CRC32 self-test + torn-write   [DONE, VERIFIED]
+│   ├── wal_check.cpp            # CRC32 self-test + torn-write   [DONE, VERIFIED]
+│   └── manifest_check.cpp       # format round-trip + corruption [DONE, VERIFIED]
 └── tests/
     └── CMakeLists.txt           # wired up in c10
 ```
@@ -582,6 +584,50 @@ The 2925→2915 shrink is exact, not approximate: 55 good records × 53 bytes/re
 the 10 hand-crafted "crash mid-write" garbage bytes were physically removed, not merely skipped
 over. Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
 
+### 4.9 Component 6 — snapshot manifest `[DONE, VERIFIED]`
+
+`write_manifest`/`read_manifest` serialize/deserialize a `Manifest` (snapshot id, creation time,
+a list of `ManifestFileEntry`) to the exact binary format in §3.3. This component is deliberately
+**opaque to the filesystem** — a `ManifestFileEntry`'s mode/size/mtime/digests arrive already
+populated; nothing here calls `stat()`, walks a directory, or touches `std::filesystem`. See the
+correction in §5.2: that dependency was originally predicted here but actually belongs to
+component 7, which is where a real directory gets turned into `ManifestFileEntry` values.
+
+**Sorting is enforced internally, not trusted to callers.** `write_manifest` sorts a local copy of
+`files` by path before serializing, regardless of what order they arrive in. §3.2 requires
+"sorted by path for determinism" — making that the caller's responsibility would mean every future
+call site has to remember it, and a single forgotten sort would silently make manifests
+non-deterministic. Enforcing it once, in the one place that writes the format, closes off that bug
+class entirely.
+
+**Fixed-width `snapshot_id` field (16 bytes: 15-char `"YYYYMMDD-HHMMSS"` + 1 NUL pad byte), unlike
+the length-prefixed `path` field.** Possible because the format guarantees the snapshot id has a
+canonical shape, and it means a reader can validate the entire fixed-size header — magic, version,
+snapshot_id, created_unix, file_count — in one pass before it has to start walking variable-length
+file entries one at a time.
+
+**Single buffered write, one `fsync`, unlike the WAL/pack file's per-operation durability.** A
+manifest has one entry per *file*, not per byte of backed-up data, so even a large backup produces
+a manifest small enough to build entirely in memory and write once at the very end of a successful
+backup run. The WAL's incremental-durability design exists specifically because a backup can run
+for a long time and a mid-run crash must not lose already-completed work; a manifest that's only
+ever written after a backup fully completes has no such requirement.
+
+**Verified on Linux** (`tools/manifest_check.cpp`, WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-08) — a
+synthetic manifest (5 files inserted deliberately out of path order, including one zero-chunk
+empty file), the `snapshot_id` 15/16-character boundary, and two corruption-detection cases (bad
+magic, truncated file):
+```
+wrote manifest: /tmp/manifest_test/snapshots/20260907-143022.manifest (5 files, inserted out of path order)
+sort-by-path OK: entries stored in ascending order regardless of insertion order
+round-trip OK: all 5 file entries (including the zero-chunk empty file) match exactly
+snapshot_id boundary OK: 15-character id accepted
+snapshot_id boundary OK: 16-character id correctly rejected
+corruption detection OK: bad magic correctly rejected
+corruption detection OK: truncated manifest correctly rejected
+```
+Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
 ---
 
 ## PART 5 — IMMEDIATE NEXT STEPS
@@ -615,7 +661,13 @@ GCC 13.3.0. `chunk_identity` reproduced §4.3 with real SHA-256 — see that sec
 numbers. This gate is closed; component 3 is next.
 
 Only C++17 dependency in the tree today: a structured binding in `chunk_identity.cpp`.
-`std::filesystem` arrives in component 6.
+`std::filesystem` arrives in component 7, not 6 — **correction from the original plan**: component
+6 (the manifest) turned out to need no filesystem access at all, since it only serializes/
+deserializes a `ManifestFileEntry` struct that's opaque to how its fields (mode/size/mtime/
+digests) were obtained. Populating those from a real directory is `std::filesystem::
+recursive_directory_iterator`'s job, and that's genuinely component 7 (the tree walk +
+thread pool), not the manifest format itself. Cleaner separation of concerns than originally
+scoped — see §4.9.
 
 ### 5.3 Then build, in order
 
