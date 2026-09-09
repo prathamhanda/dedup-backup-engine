@@ -17,11 +17,13 @@ namespace {
 // disagree on GEAR would compute different chunk boundaries for identical
 // bytes, which silently breaks deduplication between backups taken with
 // different builds. Determinism here is a correctness requirement, not a
-// nicety.
+// nicety. kGearSeed (fastcdc_chunker.hpp) is the single source of truth —
+// repo_meta.cpp persists this same constant so a repository can detect
+// and refuse a future build that would disagree with it.
 const std::array<uint64_t, 256>& gear_table() {
     static const std::array<uint64_t, 256> table = [] {
         std::array<uint64_t, 256> t{};
-        std::mt19937_64 rng(0x8f3f'73b5'cf1c'9adeULL);
+        std::mt19937_64 rng(kGearSeed);
         for (auto& v : t) v = rng();
         return t;
     }();

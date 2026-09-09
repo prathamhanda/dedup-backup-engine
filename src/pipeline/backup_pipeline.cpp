@@ -201,6 +201,13 @@ std::string make_snapshot_id(std::time_t now) {
 
 std::string run_backup(const std::string& source_dir, Repository& repo,
                         const BackupOptions& options) {
+    // Fail fast, before any file is touched: a chunk-config mismatch
+    // against repo.meta means this backup would silently stop
+    // deduplicating against what's already stored, not that anything is
+    // corrupt -- worth refusing outright rather than doing wasted work
+    // first.
+    repo.check_or_init_chunk_config(options.chunk_config);
+
     std::unique_ptr<IChunker> chunker;
     if (options.fixed_chunking) {
         chunker = std::make_unique<FixedChunker>(options.chunk_config.avg_size);

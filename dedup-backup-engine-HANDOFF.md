@@ -3,9 +3,12 @@
 **Owner:** Pratham Handa
 **Purpose:** Portfolio systems project targeting a Rubrik SWE internship application
 **Language/Platform:** C++17, Linux (WSL2 Ubuntu acceptable), CMake, OpenSSL
-**Status at handoff:** Components 1–2 written, reviewed, and **verified on real Linux** (WSL2
-Ubuntu-24.04, GCC 13.3.0, OpenSSL 3.0.13, real SHA-256) as of 2026-09-08 — see §4.3/§4.4 for the
-verified transcript. Next task: component 3 (chunk store).
+**Status at handoff:** **All 11 components complete and verified on real Linux** (WSL2
+Ubuntu-24.04, GCC 13.3.0, OpenSSL 3.0.13) as of 2026-09-09 — every component write-up in Part 4
+(§4.1–§4.15) carries a real transcript, not an assumption. `ctest` is 8/8 passing, confirmed
+idempotent, from a clean rebuild. **Next task: the reproducible kernel-tree benchmark (§6) on real
+hardware, not WSL2** — the one thing that still can't be verified from this environment, per the
+fsync-latency finding in §4.12.
 
 This document is the single source of truth. It contains the problem statement, the domain
 background, the full architecture, on-disk format specifications, per-component build
@@ -84,19 +87,19 @@ survives intact** — the cuts are all in polish, not in substance.
 
 ### 2.1 Keep (load-bearing)
 
-| # | Component | Why it must stay |
+| # | Component | Status |
 |---|-----------|------------------|
-| 1 | FastCDC chunker | The intellectual core. Already built. |
-| 2 | SHA-256 hasher | Content addressing depends on it. Already written. |
-| 3 | Chunk store (single pack file) | Where bytes actually live. |
-| 4 | Chunk index (WAL-backed, in-memory map) | Answers "do we have this chunk?" |
-| 5 | Write-ahead log | Top-three interview asset. The crash test is the differentiator. |
-| 6 | Snapshot manifest | The recipes. Without it there is no restore. |
-| 7 | Thread pool (per-file granularity) | Backs the "310 MB/s on 8 threads" claim. |
-| 8 | Restore + verify | Backs "byte-exact verified restores". |
-| 9 | Stats + bench | Produces the resume numbers. |
-| 10 | Four tests | Roundtrip, insertion-identity, crash-recovery, WAL torn-write. |
-| 11 | README | Architecture, formats, reproducible benchmark. |
+| 1 | FastCDC chunker | `[DONE, VERIFIED]` §4.1 |
+| 2 | SHA-256 hasher | `[DONE, VERIFIED]` §4.2 |
+| 3 | Chunk store (single pack file) | `[DONE, VERIFIED]` §4.6 |
+| 4 | Chunk index (WAL-backed, in-memory map) | `[DONE, VERIFIED]` §4.7 |
+| 5 | Write-ahead log | `[DONE, VERIFIED]` §4.8 |
+| 6 | Snapshot manifest | `[DONE, VERIFIED]` §4.9 |
+| 7 | Thread pool (per-file granularity) | `[DONE, VERIFIED]` §4.10 |
+| 8 | Restore + verify | `[DONE, VERIFIED]` §4.11 |
+| 9 | Stats + bench | `[DONE, VERIFIED]` §4.12 — throughput number needs real hardware |
+| 10 | Four tests (+ repo.meta test) | `[DONE, VERIFIED]` §4.13/§4.14 — 8/8 passing, idempotent |
+| 11 | README | `[DONE, VERIFIED]` §4.15 |
 
 ### 2.2 Cut (with rationale — document these as "future work" in the README)
 
@@ -167,6 +170,7 @@ dedup-backup/
 │   ├── wal.hpp                  # Wal, WalRecordType, crc32       [DONE, VERIFIED]
 │   ├── byte_io.hpp              # LE read/write helpers           [DONE, VERIFIED]
 │   ├── manifest.hpp             # ManifestFileEntry, Manifest     [DONE, VERIFIED]
+│   ├── repo_meta.hpp            # RepoMeta, write/read_repo_meta  [DONE, VERIFIED — §4.14]
 │   ├── bounded_queue.hpp        # BoundedQueue<T>                 [DONE, VERIFIED]
 │   ├── backup_pipeline.hpp      # BackupOptions, run_backup       [DONE, VERIFIED]
 │   ├── restore_pipeline.hpp     # run_restore                     [DONE, VERIFIED]
@@ -180,6 +184,7 @@ dedup-backup/
 │   ├── index/chunk_index.cpp                                     [DONE, VERIFIED]
 │   ├── wal/wal.cpp                                                [DONE, VERIFIED]
 │   ├── manifest/manifest.cpp                                     [DONE, VERIFIED]
+│   ├── repo_meta/repo_meta.cpp                                    [DONE, VERIFIED]
 │   ├── pipeline/repository.cpp, backup_pipeline.cpp              [DONE, VERIFIED]
 │   ├── pipeline/restore_pipeline.cpp, verify.cpp                 [DONE, VERIFIED]
 │   ├── stats/stats.cpp                                            [DONE, VERIFIED]
@@ -193,10 +198,11 @@ dedup-backup/
 │   ├── index_check.cpp          # store+index+hasher dedup demo  [DONE, VERIFIED]
 │   ├── wal_check.cpp            # CRC32 self-test + torn-write   [DONE, VERIFIED]
 │   └── manifest_check.cpp       # format round-trip + corruption [DONE, VERIFIED]
-└── tests/                        # [DONE, VERIFIED] all 7 pass, twice in a row (idempotent)
+└── tests/                        # [DONE, VERIFIED] all 8 pass, twice in a row (idempotent)
     ├── CMakeLists.txt
     ├── roundtrip_test.cpp        # real backup+restore, byte-exact + mode bits
     ├── insertion_identity_test.cpp  # real backup pipeline, proves CDC end-to-end
+    ├── repo_meta_test.cpp        # chunk-config mismatch correctly rejected/accepted
     └── crash_recovery_test.sh    # real kill -9 mid-backup via WAL-progress polling
 ```
 
@@ -204,14 +210,17 @@ dedup-backup/
 
 All integers little-endian. All digests 32 raw bytes.
 
-**`repo.meta`**
+**`repo.meta`** `[DONE, VERIFIED — see §4.14]`
 ```
 magic        char[8]   "DEDUPBK1"
 version      u32       = 1
 min_size     u32       = 2048
 avg_size     u32       = 8192
 max_size     u32       = 65536
-gear_seed    u64       = 20240907
+gear_seed    u64       = 0x8f3f73b5cf1c9ade   (kGearSeed, fastcdc_chunker.hpp — the "20240907"
+                                                shown in an earlier draft of this doc was a
+                                                placeholder that never matched the real
+                                                implementation constant; corrected here)
 ```
 
 **`packs/pack-000001.dat`** — raw concatenated chunk bytes, no framing. Location is
@@ -955,6 +964,88 @@ yet. Fixed by flattening every scratch path to a single level directly under
 already-verified tool binaries for a problem that a path choice sidesteps entirely.
 
 Build: zero warnings at `-Wall -Wextra` / `-std=c++17` / GCC 13.3.0.
+
+### 4.14 repo.meta — a real gap, found while writing the README, closed before it shipped
+
+While starting component 11 (README), a grep across `src/`/`include/` for `repo.meta` came back
+completely empty — despite §3.1/§3.3 speccing it explicitly and calling it "a genuinely good
+detail to be able to point at." Not one of the deliberate §2.2 cuts; simply missed. Flagged to the
+user directly rather than either silently omitting it from the README or writing docs describing a
+file that didn't exist. Implemented on the spot, not deferred:
+
+- `kGearSeed` extracted from an inline literal buried in `fastcdc_chunker.cpp` into a named
+  `constexpr` in `fastcdc_chunker.hpp` — single source of truth, since `repo_meta.cpp` now needs
+  the same value `gear_table()` uses to build the table.
+- `RepoMeta`/`write_repo_meta()`/`read_repo_meta()` (`repo_meta.hpp`/`.cpp`), exact format above.
+- `Repository::check_or_init_chunk_config()`: writes `repo.meta` on a repo's first backup, and on
+  every one after that, compares the requested config field-by-field against what's stored —
+  throwing a message naming every mismatched field with both values if anything differs. Called at
+  the very top of `run_backup()`, before any file is touched (fail fast, no wasted work).
+- **Named gap, not silently left:** only covers `FastCDCConfig`'s three sizes (`avg_size` doubles
+  as `FixedChunker`'s `chunk_size`, so `--avg-chunk-kb` drift is caught even in `--fixed-chunking`
+  mode) plus the gear seed. Does NOT detect switching between FastCDC and `--fixed-chunking` at the
+  same `avg_chunk_kb` on the same repo — sizes would match even though the chunking *strategy*
+  differs, which also breaks dedup alignment. `repo.meta`'s spec'd format has no field for that;
+  extending the format was judged out of scope for closing this one gap.
+
+**A second real bug found immediately while testing the first, through the actual CLI, not just
+the test binary:** the mismatch-rejection path worked correctly at the library level (confirmed by
+`tests/repo_meta_test.cpp`), but running the identical scenario through `dedup-backup backup`
+itself crashed outright —
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  chunk config mismatch against repo.meta -- refusing to proceed...
+Aborted (core dumped)     [exit code 134]
+```
+`cmd_backup`/`cmd_bench` in `main.cpp` never caught exceptions from `run_backup()` (unlike
+`cmd_restore`, which already did) — an uncaught exception reaching past `main()` hits
+`std::terminate()`, not a clean error and exit code. Fixed with one top-level `try`/`catch` around
+the whole subcommand dispatch in `main()`, rather than patching `cmd_backup`/`cmd_bench`
+individually — a single handler means no future subcommand can reintroduce this by omission.
+`cmd_restore`'s own more-specific catch still fires first for restore errors; this is the safety
+net for everything else. Re-ran the exact crashing command after the fix: clean `dedup-backup:
+error: ...` message on stderr, exit code 1, no crash.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-09), `tests/repo_meta_test.cpp`
+(now part of the CTest suite — 8/8 passing) plus the real CLI scenario:
+```
+mismatch correctly rejected: chunk config mismatch against repo.meta -- refusing to proceed...:
+min_size (repo: 2048, requested: 4096) avg_size (repo: 8192, requested: 16384)
+max_size (repo: 65536, requested: 131072)
+repo_meta test PASSED: mismatch rejected, matching config accepted
+```
+Full suite re-run after both fixes: **8/8 passing.** Build: zero warnings at `-Wall -Wextra` /
+`-std=c++17` / GCC 13.3.0.
+
+### 4.15 Component 11 — README `[DONE, VERIFIED]`
+
+`README.md`: architecture (with an ASCII pipeline diagram), on-disk format tables, build
+instructions, CLI reference, testing summary, benchmark section, known limitations, and a "what I'd
+do next" section — the public-facing document, distinct from this internal handoff doc.
+
+**Caught and fixed two accuracy problems in my own first draft before it shipped, not after:**
+1. The opening example showed specific kernel-tree numbers (`86213 files`, `612,884 unique
+   chunks`, `87.3% (7.9x)`) from a benchmark that hasn't been run yet — invented, not measured.
+   Replaced with the real small-scale transcript.
+2. The real small-scale transcript I substituted initially still spliced together two numbers from
+   **different, unrelated real test runs** (a "same content re-backup" scenario's snapshot IDs
+   with a completely different demo repo's `72.1% (3.59x)` stats) as if they were one continuous
+   session. Individually real, but presented together it implied a single coherent narrative that
+   never happened. Replaced with one single, internally-consistent real transcript (the
+   `demo_repo` session: 4 files, exact duplicate + 10 KB append, `270 → 272` chunks, `72.1%
+   (3.59x)`) — the same discipline this whole project has been held to throughout, now applied to
+   my own README copy, not just to code output.
+
+Also caught: an overclaim in the Windows/WSL2 build note claiming this project's *own* benchmark
+numbers were corrupted by the `/mnt/c/` cross-filesystem slowness problem — never actually
+happened in this project's history (the WSL clone was always native `~/dedup-backup-engine`); the
+real, actually-experienced problem was the fsync-virtualization finding from §4.12. Corrected to
+cite the real one.
+
+**Verified on Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, 2026-09-09): a completely clean rebuild from
+scratch (`rm -rf build` first) using the exact `cmake`/`cmake --build`/`ctest` commands the README
+itself documents — zero warnings, **8/8 tests passing** — confirming the README's own build
+instructions are what's actually verified, not just assumed to still work.
 
 ---
 

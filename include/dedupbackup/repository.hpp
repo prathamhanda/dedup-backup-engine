@@ -6,6 +6,7 @@
 
 #include "dedupbackup/chunk_index.hpp"
 #include "dedupbackup/chunk_store.hpp"
+#include "dedupbackup/fastcdc_chunker.hpp"
 #include "dedupbackup/manifest.hpp"
 #include "dedupbackup/wal.hpp"
 
@@ -75,6 +76,26 @@ public:
     // snapshot of the index instead of computing each field from a
     // separately-timed pass.
     ChunkSizeStats compute_chunk_size_stats() const;
+
+    // Enforces repo.meta (§3.3): if this repo has never been backed up
+    // to before, writes `config` (+ the build's kGearSeed) as the
+    // committed parameters. If repo.meta already exists, compares
+    // `config` against it and throws a clear std::runtime_error naming
+    // the mismatched field(s) if they differ — refusing to silently
+    // start producing chunks that won't dedup against what's already
+    // stored. Called once, at the top of run_backup(), before any work
+    // starts.
+    //
+    // Known gap, named rather than silently left: this only covers
+    // FastCDCConfig's three sizes (avg_size doubles as FixedChunker's
+    // chunk_size, so --avg-chunk-kb drift is still caught even in
+    // --fixed-chunking mode) plus the gear seed. It does NOT detect
+    // switching between FastCDC and --fixed-chunking with the same
+    // avg_chunk_kb on the same repo — the sizes would match even though
+    // the chunking STRATEGY differs, which also breaks dedup alignment.
+    // repo.meta's on-disk format (§3.3) has no field for that; extending
+    // it was judged out of scope for closing this specific gap.
+    void check_or_init_chunk_config(const FastCDCConfig& config);
 
     const std::string& path() const { return repo_path_; }
 

@@ -1,8 +1,17 @@
 #pragma once
 
+#include <cstdint>
+
 #include "dedupbackup/chunker.hpp"
 
 namespace dedupbackup {
+
+// The gear table's seed — the single source of truth, referenced by both
+// fastcdc_chunker.cpp (to build the table) and repo_meta.hpp/.cpp (to
+// persist it in repo.meta so a repo can detect a future build that
+// would chunk identical bytes differently). Must never change without a
+// version bump; see fastcdc_chunker.cpp's gear_table() for why.
+inline constexpr uint64_t kGearSeed = 0x8f3f73b5cf1c9adeULL;
 
 struct FastCDCConfig {
     size_t min_size = 2 * 1024;   // hard floor: never cut before this many bytes

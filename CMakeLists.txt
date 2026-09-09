@@ -28,6 +28,7 @@ add_library(dedupbackup_core STATIC
     src/index/chunk_index.cpp
     src/wal/wal.cpp
     src/manifest/manifest.cpp
+    src/repo_meta/repo_meta.cpp
     src/pipeline/repository.cpp
     src/pipeline/backup_pipeline.cpp
     src/pipeline/restore_pipeline.cpp

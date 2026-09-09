@@ -13,6 +13,10 @@ target_link_libraries(insertion_identity_test PRIVATE dedupbackup_core)
 add_test(NAME insertion_identity COMMAND insertion_identity_test)
 set_tests_properties(insertion_identity PROPERTIES TIMEOUT 120)
 
+add_executable(repo_meta_test repo_meta_test.cpp)
+target_link_libraries(repo_meta_test PRIVATE dedupbackup_core)
+add_test(NAME repo_meta COMMAND repo_meta_test)
+
 add_test(NAME crash_recovery
          COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/crash_recovery_test.sh"
                  "$<TARGET_FILE:dedup-backup>")

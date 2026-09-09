@@ -222,13 +222,28 @@ int main(int argc, char** argv) {
     const std::string command = argv[1];
     const Args args = parse_args(argc, argv, 2);
 
-    if (command == "init") return cmd_init(args);
-    if (command == "backup") return cmd_backup(args);
-    if (command == "restore") return cmd_restore(args);
-    if (command == "verify") return cmd_verify(args);
-    if (command == "list") return cmd_list(args);
-    if (command == "stats") return cmd_stats(args);
-    if (command == "bench") return cmd_bench(args);
+    // A single top-level try/catch, rather than one per subcommand
+    // (cmd_restore's own catch, below, still fires first and gives a
+    // more specific message -- this is the safety net for everything
+    // else). Found the hard way: an uncaught exception from
+    // check_or_init_chunk_config() during `backup` used to propagate
+    // past main() entirely, hitting std::terminate() -- SIGABRT, exit
+    // code 134, "terminate called after throwing an instance of..." --
+    // instead of the clean error message and exit code 1 a CLI tool
+    // should give for an expected, named failure mode. One handler here
+    // means no future subcommand can reintroduce that bug by omission.
+    try {
+        if (command == "init") return cmd_init(args);
+        if (command == "backup") return cmd_backup(args);
+        if (command == "restore") return cmd_restore(args);
+        if (command == "verify") return cmd_verify(args);
+        if (command == "list") return cmd_list(args);
+        if (command == "stats") return cmd_stats(args);
+        if (command == "bench") return cmd_bench(args);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "dedup-backup: error: %s\n", e.what());
+        return 1;
+    }
 
     std::fprintf(stderr, "dedup-backup: unknown subcommand '%s'\n", command.c_str());
     return 1;

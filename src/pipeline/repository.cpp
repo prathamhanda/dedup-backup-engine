@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <stdexcept>
 
+#include "dedupbackup/repo_meta.hpp"
+
 namespace dedupbackup {
 
 namespace {
@@ -97,6 +99,49 @@ ChunkSizeStats Repository::compute_chunk_size_stats() const {
         stats.median_chunk_size = sizes[sizes.size() / 2];
     }
     return stats;
+}
+
+void Repository::check_or_init_chunk_config(const FastCDCConfig& config) {
+    const std::string meta_path = repo_path_ + "/repo.meta";
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(meta_path, ec);
+
+    if (!exists) {
+        RepoMeta meta;
+        meta.min_size = static_cast<uint32_t>(config.min_size);
+        meta.avg_size = static_cast<uint32_t>(config.avg_size);
+        meta.max_size = static_cast<uint32_t>(config.max_size);
+        meta.gear_seed = kGearSeed;
+        write_repo_meta(meta_path, meta);
+        return;
+    }
+
+    const RepoMeta stored = read_repo_meta(meta_path);
+    std::string mismatches;
+    if (stored.min_size != config.min_size) {
+        mismatches += "min_size (repo: " + std::to_string(stored.min_size) + ", requested: " +
+                      std::to_string(config.min_size) + ") ";
+    }
+    if (stored.avg_size != config.avg_size) {
+        mismatches += "avg_size (repo: " + std::to_string(stored.avg_size) + ", requested: " +
+                      std::to_string(config.avg_size) + ") ";
+    }
+    if (stored.max_size != config.max_size) {
+        mismatches += "max_size (repo: " + std::to_string(stored.max_size) + ", requested: " +
+                      std::to_string(config.max_size) + ") ";
+    }
+    if (stored.gear_seed != kGearSeed) {
+        mismatches += "gear_seed (repo: " + std::to_string(stored.gear_seed) + ", this build: " +
+                      std::to_string(kGearSeed) + ") ";
+    }
+
+    if (!mismatches.empty()) {
+        throw std::runtime_error(
+            "chunk config mismatch against repo.meta -- refusing to proceed, since chunking "
+            "with different parameters would silently stop deduplicating against what's "
+            "already stored: " +
+            mismatches);
+    }
 }
 
 std::vector<std::string> Repository::list_snapshots() const {
