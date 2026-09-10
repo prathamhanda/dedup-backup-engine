@@ -239,18 +239,25 @@ tool (`tools/chunk_identity.cpp`):
 [Fixed-size]  min=15 max=512 mean=266.30 -- naive fixed blocks: hundreds of chunks differ
 ```
 
-### What's NOT yet included, and why
+### Scope decision: no throughput (MB/s) claim
 
 `bench`'s phase-breakdown correctly identified `fsync` (inside the WAL/store's single-mutex
 critical section) as the dominant cost on the WSL2 development environment — but the *absolute*
-throughput number it produced there (0.3 MB/s) is not representative of real hardware. Isolating
+throughput number it produced there (0.3 MB/s) isn't representative of real hardware. Isolating
 `fsync()` in a standalone C program with zero project code involved measured ~12.4 ms/call on that
 setup, against a typical bare-metal SSD's sub-millisecond latency — a 10–100× gap entirely
-attributable to WSL2's virtualized disk stack, not the engine. **The reproducible benchmark
-procedure below is what produces a trustworthy number; run it on real hardware before quoting
-one.**
+attributable to WSL2's virtualized disk stack, not the engine.
 
-### Reproducible procedure (run on real Linux hardware, not a VM)
+Getting a trustworthy MB/s number requires real (non-virtualized) Linux hardware, which this
+project's development environment doesn't have. Rather than publish a number known to be an
+artifact of the wrong environment, **this project deliberately doesn't claim a throughput
+figure** — the dedup ratio/factor above, and the correctness/crash-safety guarantees verified by
+the test suite, are the real, defensible results. The procedure below reproduces the full
+large-scale run (dedup ratio on real kernel source, chunk-size sweep, resync distribution on real
+low-entropy source) for anyone who wants to extend this on their own hardware — none of it was run
+at this scale as part of this project's own verification.
+
+### Reproducible procedure (for extending this on real Linux hardware, not a VM)
 
 ```bash
 mkdir -p ~/bench && cd ~/bench

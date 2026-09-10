@@ -3,12 +3,15 @@
 **Owner:** Pratham Handa
 **Purpose:** Portfolio systems project targeting a Rubrik SWE internship application
 **Language/Platform:** C++17, Linux (WSL2 Ubuntu acceptable), CMake, OpenSSL
-**Status at handoff:** **All 11 components complete and verified on real Linux** (WSL2
-Ubuntu-24.04, GCC 13.3.0, OpenSSL 3.0.13) as of 2026-09-09 — every component write-up in Part 4
+**Status: PROJECT COMPLETE** as of 2026-09-10. **All 11 components built and verified on real
+Linux** (WSL2 Ubuntu-24.04, GCC 13.3.0, OpenSSL 3.0.13) — every component write-up in Part 4
 (§4.1–§4.15) carries a real transcript, not an assumption. `ctest` is 8/8 passing, confirmed
-idempotent, from a clean rebuild. **Next task: the reproducible kernel-tree benchmark (§6) on real
-hardware, not WSL2** — the one thing that still can't be verified from this environment, per the
-fsync-latency finding in §4.12.
+idempotent, from a clean rebuild. The kernel-tree benchmark in Part 6 was deliberately NOT run —
+see the resume-claims table there: the owner chose to skip the throughput (MB/s) claim rather than
+publish a number known to be a WSL2 virtualization artifact, so there is no outstanding task
+blocking completion. If a future session picks this back up, Part 6's still-open follow-ups
+(real-scale dedup ratio, chunk-size sweep, resync-on-real-source) are optional extensions, not
+unfinished work.
 
 This document is the single source of truth. It contains the problem statement, the domain
 background, the full architecture, on-disk format specifications, per-component build
@@ -1129,18 +1132,34 @@ dedup-backup bench ~/bench/tree-1 --repo ~/repo-bench
 Also run: the 50-offset resync sweep against a kernel tree (not just synthetic), and the
 `content_defined` truncation ratio for both datasets.
 
-### Resume claims that must come from this run
+### Resume claims — decision made 2026-09-10: no throughput number, kernel-tree run not performed
 
-The following are currently **targets**, not measurements. Replace with real numbers before
-submitting anything.
+**Explicit scope decision, not a gap:** presented with the choice (skip MB/s entirely / spin up a
+cheap cloud VM for a real number / run a smaller dataset on WSL2 anyway / use real hardware if
+available), the owner chose to **skip the throughput claim entirely** rather than publish a number
+known to be a WSL2 virtualization artifact, or spend more time/infra on it. The full 8-tree kernel
+benchmark in this Part was consequently never run as part of this project's own verification — the
+commands above remain here as a documented, reproducible procedure for anyone (including a future
+session) who wants to extend the project onto real hardware, not as an outstanding task blocking
+completion.
 
-| Claim on resume | Target | Notes |
+**What the project actually claims, all real and verified (WSL2 Ubuntu-24.04, GCC 13.3.0, small
+scale — see §4.3-§4.15):**
+
+| Claim | Value | Backed by |
 |---|---|---|
-| Dedup reduction | **76% (4.2×)** | Conservative for 8 kernel trees. 71% or 81% is fine — quote the real one. |
-| Dataset size | **9.6 GB** | Whatever your extraction actually totals. |
-| Throughput | **310 MB/s on 8 threads** | Deliberately conservative. SHA-256 without SHA-NI runs ~250–400 MB/s per core; you will likely beat this. |
-| Crash-consistent WAL | — | Backed by the crash-recovery test. |
-| Byte-exact verified restores | — | Backed by manifest file digests. |
+| Dedup reduction (small-scale demo) | **72.1% (3.59x)** | Real `stats` output, §4.12 |
+| Insertion resync | **Exactly 1 chunk differs, 50/50 trials** | Real `chunk_identity` output, §4.3 |
+| Crash-consistent WAL | Orphan-only on crash, never corruption | Real `SIGKILL` mid-backup test, §4.13 |
+| Byte-exact verified restores | Independent whole-file SHA-256 check | `roundtrip` test + hand-corrupted pack file test, §4.11 |
+| Throughput (MB/s) | **Not claimed** | Deliberate — see README's "Scope decision" under Benchmarks |
+
+If a future session or a different environment makes real Linux hardware available, the
+still-open, still-worthwhile follow-ups are: the actual 8-kernel-tree dedup ratio (the 72.1% figure
+is from 4 synthetic files, not real source at scale), the chunk-size sweep, and — probably the
+single most interesting unanswered empirical question left in this project — whether the
+`max_size`-truncation-breaks-resync concern from §4.5 actually manifests on real low-entropy source
+code, or stays as negligible as it was on synthetic random data.
 
 ---
 
