@@ -23,19 +23,15 @@ dedup saved:        72.1% (3.59x)
 
 ## 💡 Why This Matters
 
-<details>
 <summary><strong>The Problem with Fixed Size Chunking</strong></summary>
 
 If you simply split a file into fixed 8 KB blocks, the system fails catastrophically on the most common edit: inserting data. If you insert one byte at the beginning of a file, every subsequent block boundary shifts by one byte. The dedup ratio drops to zero. We measured this. Over 50 trials of inserting a single byte into a file, fixed size chunking caused an average of 266 chunks to differ.
 
-</details>
 
-<details>
 <summary><strong>The Solution: Content Defined Chunking</strong></summary>
 
 Content Defined Chunking (CDC) makes the cut decision based on local content instead of absolute position. By using a rolling gear hash, an insertion only disturbs the specific chunks touching the edit. The rest of the file realigns automatically. In our 50 trial benchmark, FastCDC resulted in exactly 1 chunk difference every single time. This is the magic of CDC.
 
-</details>
 
 ## ✨ Core Features
 * **FastCDC**: Employs the FastCDC algorithm for content defined chunking, ensuring robust deduplication even with data insertions or deletions.
@@ -103,7 +99,7 @@ All multi byte integers are stored in little endian.
 
 </details>
 
-## 🚀 Journey and Milestones
+## ✨ Journey and Milestones
 
 Building this engine was a methodical process, broken down into deliberate milestones to ensure every layer was rock solid before adding complexity.
 
